@@ -1,8 +1,10 @@
 use serde_derive::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use pickledb::{PickleDb, PickleDbDumpPolicy, SerializationMethod};
-use warp::{Filter, Rejection, Reply};
-// use warp::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+// use pickledb::error::{Error, ErrorType};
+use warp::{Filter, /*Rejection, Reply,*/ http::header::HeaderValue};
+use core::convert::Infallible;
+use std::sync::{Arc, Mutex};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Batch{
@@ -22,69 +24,80 @@ pub struct OutgoingMessage {
     seq_id: u64,
 }
 
-pub struct Message {
-    to: String,
-    outgoing: OutgoingMessage,
-}
-
-struct Store {
+pub struct Store {
+    seq : u64,
     db: PickleDb,
 }
 
 impl Store {
-    fn new(db_path: &str) -> Self {
+    fn init(db_path: &str) -> Self {
         let db = PickleDb::new(
             db_path,
             PickleDbDumpPolicy::AutoDump,
             SerializationMethod::Json,
         );
-        Store { db }
+        Store { seq: 0, db: db }
     }
 
+    // FIXME : return error so that it can be formatted in response
     fn add_message(&mut self, device_id: String, message: &OutgoingMessage) -> Result<(), pickledb::error::Error> {
-        // add locks on this (or txn in pickle?)
-        let res;
+
         if !self.db.lexists(&device_id) {
-            res = self.db.lcreate(&device_id).unwrap().ladd(message);
+            self.db.lcreate(&device_id).unwrap().ladd(message);
             Ok(())
         } else {
-            res = self.db.ladd(&device_id, message);
+            self.db.ladd(&device_id, message);
             Ok(())
         }
     }
+
+    fn up(&mut self) -> u64 {
+        self.seq += 1;
+        return self.seq
+    }
 }
 
-async fn post_message(
+pub fn add<T>(s: T) -> impl Filter<Extract = (T,), Error = std::convert::Infallible> + Clone
+where
+  T: Clone + Send,
+{
+  warp::any().map(move || s.clone())
+}
+
+
+pub async fn post_message(
+    header: HeaderValue,
+    store: Arc<Mutex<Store>>,
     batch: Batch,
-    store: Store,
-) -> Result<impl Reply, Rejection> {
+) -> Result<impl warp::Reply, Infallible> {
 
-    //get sender id
-    let sender_id = warp::header::<String>("authorization");
+    //process header
+    let sender_id = header.to_str().unwrap();
+    // let batch = warp::body::json()::<Batch>;
 
-    //unbatch and puth messages
-    // let batch = warp::body()::<Batch>("batch");
+    let mut s = store.lock().unwrap();
     for message in batch.messages.iter() {
-        let mut m = OutgoingMessage{
-            sender: sender_id,
-            payload: message.payload,
-            seq_id: 0, //FIXME: impl this
+        let m = OutgoingMessage{
+            sender: sender_id.to_string(),
+            payload: message.payload.clone(),
+            seq_id: Store::up(&mut s), 
         };
-        store.add_message(message.device_id, &m);
-    }
+        Store::add_message(&mut s, message.device_id.clone(), &m);
+    };
+
     Ok(format!("Message added from : {:?}", sender_id))
 }
 
 #[tokio::main]
 async fn main() {
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
-
-    let mut store = Store::new("noise.db");
+    let store_arc = Arc::new(Mutex::new(Store::init("noise.db")));
 
     // Define routes for handling messages
     let post_message_route = warp::path("message")
         .and(warp::post())
-        .and(warp::header::headers_cloned())
+        .and(warp::header::value("authentication"))
+        .and(add(store_arc))
         .and(warp::body::json())
         .and_then(post_message);
 
@@ -98,7 +111,7 @@ async fn main() {
 
     // let routes = post_message_route.and(get_messages_route).and(delete_messages_route);
 
-    warp::serve(post_message_route).run(([127, 0, 0, 1], 3030)).await
+    warp::serve(post_message_route).run(addr).await
 }
 
 #[tokio::test]
