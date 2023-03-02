@@ -7,6 +7,7 @@ use core::convert::Infallible;
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use std::result::Result;
+use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Batch{
@@ -43,19 +44,19 @@ impl From<OtkeyResponse> for String {
   }
 }
 
-pub struct Store {
+pub struct MessageStorage {
     seq : u64,
     db: PickleDb,
 }
 
-impl Store {
-    fn init(db_path: &str) -> Self {
+impl MessageStorage {
+    fn new(db_path: &str) -> Self {
         let db = PickleDb::new(
             db_path,
             PickleDbDumpPolicy::AutoDump,
             SerializationMethod::Json,
         );
-        Store { seq: 0, db: db }
+        MessageStorage { seq: 0, db: db }
     }
 
     fn up(&mut self) -> u64 {
@@ -108,6 +109,19 @@ impl Store {
         Ok("delete".to_string())
     }
 
+    fn get_key(&mut self, one_time_key: String) -> String {
+        let mut key =  self.db.get::<String>(&one_time_key).unwrap();
+        return key.strip_prefix("otkeys/".to_string());
+        
+    }
+
+    fn set_keys(&mut self, keys: HashMap<String, String>) -> Result<String, String>{
+        for (key, value) in keys {
+            self.db.set(&("otkeys/".to_owned() + &key), &value);
+        };
+        Ok(())
+    }
+
 }
 
 /**
@@ -121,7 +135,7 @@ where T: Clone + Send,
 
 pub async fn post_message(
     header: HeaderValue,
-    store: Arc<Mutex<Store>>,
+    store: Arc<Mutex<MessageStorage>>,
     batch: Batch,
 ) -> Result<impl warp::Reply, Infallible> {
 
@@ -133,9 +147,9 @@ pub async fn post_message(
         let m = OutgoingMessage{
             sender: sender_id.to_string(),
             payload: message.payload.clone(),
-            seq_id: Store::up(&mut s), 
+            seq_id: MessageStorage::up(&mut s), 
         };
-        Store::add_message(&mut s, message.device_id.clone(), &m);
+        MessageStorage::add_message(&mut s, message.device_id.clone(), &m);
     };
 
     Ok(format!("Message added from : {:?}", sender_id))
@@ -143,30 +157,37 @@ pub async fn post_message(
 
 pub async fn delete_messages(
     header: HeaderValue,
-    store: Arc<Mutex<Store>>,
+    store: Arc<Mutex<MessageStorage>>,
     seq: u64,
 ) -> Result<impl warp::Reply, Infallible> {
 
     let sender_id = header.to_str().unwrap();
     let mut s = store.lock().await;
 
-    Store::empty_mailbox(&mut s, sender_id.to_string(), seq);
+    MessageStorage::empty_mailbox(&mut s, sender_id.to_string(), seq);
 
     Ok(format!("Messages removed from : {:?} up to : {:?}", sender_id, seq))
 }
 
 pub async fn get_messages(
     header: HeaderValue,
-    store: Arc<Mutex<Store>>
+    store: Arc<Mutex<MessageStorage>>
 ) -> Result<impl warp::Reply, Infallible> {
     let sender_id = header.to_str().unwrap();
     let mut s = store.lock().await;
 
-    let messages = Store::get_mailbox(&mut s, sender_id.to_string());
+    let messages = MessageStorage::get_mailbox(&mut s, sender_id.to_string());
     Ok(warp::reply::json(&messages))
 }
 
-pub fn handlers (store_arc: Arc<Mutex<Store>>) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone{
+pub async fn get_one_time_key(
+    param: String,
+    store: Arc<Mutex<MessageStorage>>
+)-> Result<impl warp::Reply, Infallible> {
+
+}
+
+pub fn handlers (store_arc: Arc<Mutex<MessageStorage>>) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone{
     let post_message_route = warp::path("message")
         .and(warp::post())
         .and(warp::header::value("authentication"))
@@ -183,9 +204,15 @@ pub fn handlers (store_arc: Arc<Mutex<Store>>) -> impl Filter<Extract = impl war
     let delete_messages_route = warp::path("self/messages")
         .and(warp::delete())
         .and(warp::header::value("authentication"))
-        .and(add(store_arc))
+        .and(add(store_arc.clone()))
         .and(warp::body::json())
         .and_then(delete_messages);
+    
+    let get_one_time_key_route = warp::path("/devices/otkey")
+        .and(warp::get())
+        .and(warp::query::<String>())
+        .and(add(store_arc))
+        .and_then(get_one_time_key);
 
     return post_message_route.or(get_messages_route).or(delete_messages_route)
 }
@@ -193,9 +220,8 @@ pub fn handlers (store_arc: Arc<Mutex<Store>>) -> impl Filter<Extract = impl war
 #[tokio::main]
 async fn main() {
     let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
-    let store_arc = Arc::new(Mutex::new(Store::init("noise.db")));
+    let store_arc = Arc::new(Mutex::new(MessageStorage::new("noise.db")));
 
     let routes = handlers(store_arc);
     warp::serve(routes).run(addr).await
 }
-
