@@ -33,17 +33,6 @@ pub struct OutgoingMessage {
     seq_id: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct OtkeyResponse {
-  otkey: String,
-}
-
-impl From<OtkeyResponse> for String {
-  fn from(otkey_response: OtkeyResponse) -> String {
-    otkey_response.otkey
-  }
-}
-
 pub struct MessageStorage {
     seq : u64,
     db: PickleDb,
@@ -109,17 +98,15 @@ impl MessageStorage {
         Ok("delete".to_string())
     }
 
-    fn get_key(&mut self, one_time_key: String) -> String {
-        let mut key =  self.db.get::<String>(&one_time_key).unwrap();
-        return key.strip_prefix("otkeys/".to_string());
-        
+    fn get(&mut self, key: String) -> String {
+        let key =  self.db.get::<String>(&key).unwrap();
+        return key;
     }
 
-    fn set_keys(&mut self, keys: HashMap<String, String>) -> Result<String, String>{
-        for (key, value) in keys {
-            self.db.set(&("otkeys/".to_owned() + &key), &value);
-        };
-        Ok(())
+    fn set(&mut self, key: String, value: String) -> Result<String, String>{
+        
+        self.db.set(&key, &value);
+        Ok("otkeys set".to_string())
     }
 
 }
@@ -141,17 +128,18 @@ pub async fn post_message(
 
     let sender_id = header.to_str().unwrap();
     //put lock call here so login of converting messages is not done within "store" functions
+
     let mut s = store.lock().await;
 
+    let seq = MessageStorage::up(&mut s);
     for message in batch.messages.iter() {
         let m = OutgoingMessage{
             sender: sender_id.to_string(),
             payload: message.payload.clone(),
-            seq_id: MessageStorage::up(&mut s), 
+            seq_id: seq, 
         };
         MessageStorage::add_message(&mut s, message.device_id.clone(), &m);
     };
-
     Ok(format!("Message added from : {:?}", sender_id))
 }
 
@@ -185,6 +173,26 @@ pub async fn get_one_time_key(
     store: Arc<Mutex<MessageStorage>>
 )-> Result<impl warp::Reply, Infallible> {
 
+    // doesn't necessarily need to lock store? can occur concurrenly to message posting if pickle allows
+    let mut s = store.lock().await;
+    let key = "otkeys/".to_owned() + &param;
+    let value = MessageStorage::get(&mut s, key);
+    Ok(warp::reply::json(&value))
+}
+
+pub async fn set_one_time_keys(
+    header: HeaderValue,
+    store: Arc<Mutex<MessageStorage>>,
+    keys: HashMap<String, String>,
+)-> Result<impl warp::Reply, Infallible> {
+
+    let sender_id = header.to_str().unwrap();
+    let mut s = store.lock().await;
+
+    for (key, value) in &keys{
+        s.set(key.to_string(), value.to_string() );
+    }
+    Ok(warp::reply::json(&keys))
 }
 
 pub fn handlers (store_arc: Arc<Mutex<MessageStorage>>) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone{
@@ -195,31 +203,42 @@ pub fn handlers (store_arc: Arc<Mutex<MessageStorage>>) -> impl Filter<Extract =
         .and(warp::body::json())
         .and_then(post_message);
 
-    let get_messages_route = warp::path("self/messages")
+    let get_messages_route = warp::path!("self" / "messages")
         .and(warp::get())
         .and(warp::header::value("authentication"))
         .and(add(store_arc.clone()))
         .and_then(get_messages);
 
-    let delete_messages_route = warp::path("self/messages")
+    let delete_messages_route = warp::path!("self" / "messages")
         .and(warp::delete())
         .and(warp::header::value("authentication"))
         .and(add(store_arc.clone()))
         .and(warp::body::json())
         .and_then(delete_messages);
     
-    let get_one_time_key_route = warp::path("/devices/otkey")
+    let get_one_time_key_route = warp::path!("devices" / "otkey")
         .and(warp::get())
         .and(warp::query::<String>())
-        .and(add(store_arc))
+        .and(add(store_arc.clone()))
         .and_then(get_one_time_key);
 
-    return post_message_route.or(get_messages_route).or(delete_messages_route)
+    let post_one_time_key_routes = warp::path!("self" / "otkeys")
+        .and(warp::post())
+        .and(warp::header::value("authentication"))
+        .and(add(store_arc))
+        .and(warp::body::json())
+        .and_then(set_one_time_keys);
+
+    return post_message_route
+        .or(get_messages_route)
+        .or(delete_messages_route)
+        .or(get_one_time_key_route)
+        .or(post_one_time_key_routes);
 }
 
 #[tokio::main]
 async fn main() {
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     let store_arc = Arc::new(Mutex::new(MessageStorage::new("noise.db")));
 
     let routes = handlers(store_arc);
