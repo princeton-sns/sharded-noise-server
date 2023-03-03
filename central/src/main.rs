@@ -170,12 +170,13 @@ pub async fn get_messages(
 
 pub async fn get_one_time_key(
     param: String,
-    store: Arc<Mutex<MessageStorage>>
+    store: Arc<Mutex<MessageStorage>>,
+    device_id: String,
 )-> Result<impl warp::Reply, Infallible> {
 
     // doesn't necessarily need to lock store? can occur concurrenly to message posting if pickle allows
     let mut s = store.lock().await;
-    let key = "otkeys/".to_owned() + &param;
+    let key = "otkey/".to_owned() + &device_id + &"/".to_owned() + &param;
     let value = MessageStorage::get(&mut s, key);
     Ok(warp::reply::json(&value))
 }
@@ -190,28 +191,29 @@ pub async fn set_one_time_keys(
     let mut s = store.lock().await;
 
     for (key, value) in &keys{
-        s.set(key.to_string(), value.to_string() );
+        s.set(key.to_string() + &"/".to_owned() + &sender_id.to_string() , value.to_string() );
     }
     Ok(warp::reply::json(&keys))
 }
 
 pub fn handlers (store_arc: Arc<Mutex<MessageStorage>>) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone{
+
     let post_message_route = warp::path("message")
         .and(warp::post())
-        .and(warp::header::value("authentication"))
+        .and(warp::header::value("Authentication"))
         .and(add(store_arc.clone()))
         .and(warp::body::json())
         .and_then(post_message);
 
     let get_messages_route = warp::path!("self" / "messages")
         .and(warp::get())
-        .and(warp::header::value("authentication"))
+        .and(warp::header::value("Authentication"))
         .and(add(store_arc.clone()))
         .and_then(get_messages);
 
     let delete_messages_route = warp::path!("self" / "messages")
         .and(warp::delete())
-        .and(warp::header::value("authentication"))
+        .and(warp::header::value("Authentication"))
         .and(add(store_arc.clone()))
         .and(warp::body::json())
         .and_then(delete_messages);
@@ -220,20 +222,26 @@ pub fn handlers (store_arc: Arc<Mutex<MessageStorage>>) -> impl Filter<Extract =
         .and(warp::get())
         .and(warp::query::<String>())
         .and(add(store_arc.clone()))
+        .and(warp::body::json())
         .and_then(get_one_time_key);
 
-    let post_one_time_key_routes = warp::path!("self" / "otkeys")
+    let post_one_time_keys_route = warp::path!("self" / "otkeys")
         .and(warp::post())
-        .and(warp::header::value("authentication"))
+        .and(warp::header::value("Authentication"))
         .and(add(store_arc))
         .and(warp::body::json())
         .and_then(set_one_time_keys);
+
+    //  let events_route = warp::path("events")
+    //     .and(warp::get())
+    //     .and(add(store_arc.clone()))
+    //     .and_then()
 
     return post_message_route
         .or(get_messages_route)
         .or(delete_messages_route)
         .or(get_one_time_key_route)
-        .or(post_one_time_key_routes);
+        .or(post_one_time_keys_route);
 }
 
 #[tokio::main]
