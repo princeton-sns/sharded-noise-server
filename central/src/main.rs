@@ -83,7 +83,7 @@ impl MessageStorage {
 
     fn empty_mailbox(&mut self, device_id: String, seq_number: u64) -> Result<String, String>{
 
-        //note : can't remove while iterating over
+        //note : can't remove while iterating
         let mut stale_messages : Vec<OutgoingMessage> = Vec::new();
         for m in self.db.liter(&device_id) {
             let message = m.get_item::<OutgoingMessage>().unwrap();
@@ -91,7 +91,6 @@ impl MessageStorage {
                 stale_messages.push(message)
             }
         }
-
         for message in stale_messages {
             self.db.lrem_value(&device_id, &message);
         }
@@ -109,6 +108,11 @@ impl MessageStorage {
         Ok("otkeys set".to_string())
     }
 
+}
+
+pub struct Server {
+    storage: MessageStorage,
+    
 }
 
 /**
