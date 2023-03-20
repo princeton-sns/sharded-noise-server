@@ -36,9 +36,42 @@ A multithreaded version of central server.
 
 ## [In progress] Parallel
 
-Using actix.
+Use actix/erlang.
+
+Cool: everyone interacts with the same server to send messages, but has own
+instance to receive messages from.
+
+Not cool: 
+
 
 ### Design
 
-buckets :)
+**Request handler**
 
+Handles requests and assigns messages to incoming message actors based on the 
+sender.
+
+**Incoming message actors**
+
+Two actos that flip states between receiving messages and sending messages.
+The sending actors forward messages to the mailboxes.
+
+**Sequencer**
+
+**Mailbox**
+
+### Verifying correct behavior
+
+Each actor in the system will sign over the message before forwarding it to the
+next actor.
+Incoming message actor needs to sign over message bundle, the epoch number, and
+the index of the bundle in its queue.
+Outgoing message actors will need to sign over the incoming signature, the message itself 
+(after the bundle is distributed), as well as the sequence id and a per-client sequence number.
+
+If a client catches a reordering, it complains to its mailbox, i.e. outgoing actor. The outgoing
+actor can "accept blame" or find out which incoming actor is responsible for the error.
+The mailbox can then pinpoint where the reordering occured in the system.
+
+Clients can request their mailbox be transferred to a different actor or handled
+by a different incoming message actor.
