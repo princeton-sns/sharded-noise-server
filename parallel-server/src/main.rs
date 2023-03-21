@@ -153,17 +153,17 @@ pub mod inbox {
 
     #[derive(Debug, Clone)]
     pub struct RoutedMessage {
-        sender: String,
-        payload: crate::protocol::Payload,
-        inbox_index: u16,
+        pub sender: String,
+        pub payload: crate::protocol::Message,
+        pub inbox_index: u64,
     }
 
     #[derive(Message, Clone, Debug)]
     #[rtype(result = "()")]
     pub struct RoutedEpochBatch {
-        epoch_id: u64,
-        inbox_id: u16,
-        messages: LinkedList<RoutedMessage>,
+        pub epoch_id: u64,
+        pub inbox_id: u16,
+        pub messages: LinkedList<RoutedMessage>,
     }
 
     struct RouterActor {
@@ -191,13 +191,13 @@ pub mod inbox {
 
             for (idx, ev) in queue.into_iter().enumerate() {
                 for message in ev.bundle.batch.into_iter() {
+                    let bucket = hash_into_bucket(&message.device_id, mailboxes.len());
                     let rt_msg = RoutedMessage {
                         sender: ev.sender.clone(),
-                        payload: message.payload,
-                        inbox_index: idx as u16,
+                        payload: message,
+                        inbox_index: idx as u64,
                     };
 
-                    let bucket = hash_into_bucket(&message.device_id, mailboxes.len());
                     mailboxes[bucket].push_back(rt_msg);
                 }
             }
@@ -209,7 +209,7 @@ pub mod inbox {
                     messages,
                 };
 
-                outbox.do_send(routed_batch);
+                outbox.0.do_send(routed_batch);
             }
         }
     }
@@ -291,38 +291,48 @@ pub mod inbox {
 }
 
 pub mod outbox {
+    use crate::inbox::{RoutedEpochBatch, RoutedMessage};
     use actix::{Actor, Addr, Context, Handler, Message};
-    use std::collections::LinkedList;
+    use std::collections::{HashMap, LinkedList};
+    use std::mem;
     use std::sync::Arc;
 
     #[derive(Message, Clone)]
     #[rtype(result = "()")]
     pub struct Initialize(pub Arc<crate::AppState>);
 
-    pub struct OutboxActor {
+    pub struct ReceiverActor {
         id: u16,
+        outbox_address: Addr<OutboxActor>,
         state: Option<Arc<crate::AppState>>,
+        input_queues: Vec<Option<RoutedEpochBatch>>,
     }
 
-    impl OutboxActor {
-        pub fn new(id: u16) -> Self {
-            OutboxActor { id, state: None }
+    impl ReceiverActor {
+        pub fn new(id: u16, outbox_address: Addr<OutboxActor>) -> Self {
+            ReceiverActor {
+                id,
+                outbox_address,
+                state: None,
+                input_queues: Vec::new(),
+            }
         }
     }
 
-    impl Actor for OutboxActor {
+    impl Actor for ReceiverActor {
         type Context = Context<Self>;
     }
 
-    impl Handler<Initialize> for OutboxActor {
+    impl Handler<Initialize> for ReceiverActor {
         type Result = ();
 
         fn handle(&mut self, msg: Initialize, _ctx: &mut Context<Self>) -> Self::Result {
+            self.input_queues = vec![None; msg.0.inbox_actors.len()];
             self.state = Some(msg.0);
         }
     }
 
-    impl Handler<crate::inbox::RoutedEpochBatch> for OutboxActor {
+    impl Handler<crate::inbox::RoutedEpochBatch> for ReceiverActor {
         type Result = ();
 
         fn handle(
@@ -330,7 +340,57 @@ pub mod outbox {
             msg: crate::inbox::RoutedEpochBatch,
             _ctx: &mut Context<Self>,
         ) -> Self::Result {
-            println!("Outbox {} received: {:?}", self.id, msg);
+            let inbox_id = msg.inbox_id as usize;
+            self.input_queues[inbox_id] = Some(msg);
+
+            // check if every element of input_queus has been written to
+            if self.input_queues.iter().find(|v| v.is_none()).is_none() {
+                let mut output_map = HashMap::new();
+                for b in mem::replace(
+                    &mut self.input_queues,
+                    vec![None; self.state.as_ref().unwrap().inbox_actors.len()],
+                )
+                .into_iter()
+                {
+                    let batch = b.unwrap();
+                    let inbox_id = batch.inbox_id;
+                    for mut message in batch.messages.into_iter() {
+                        message.inbox_index =
+                            (message.inbox_index & 0x0000FFFFFFFFFFFF) | ((inbox_id as u64) << 48);
+                        let device_messages = output_map
+                            .entry(message.payload.device_id.clone())
+                            .or_insert_with(|| LinkedList::new());
+                        device_messages.push_back((batch.epoch_id, message));
+                    }
+                }
+                self.outbox_address.do_send(DeviceEpochBatch(output_map))
+            }
+        }
+    }
+
+    pub struct OutboxActor {
+        id: u16,
+    }
+
+    impl OutboxActor {
+        pub fn new(id: u16) -> Self {
+            OutboxActor { id }
+        }
+    }
+
+    impl Actor for OutboxActor {
+        type Context = Context<Self>;
+    }
+
+    #[derive(Message, Clone, Debug)]
+    #[rtype(result = "()")]
+    pub struct DeviceEpochBatch(pub HashMap<String, LinkedList<(u64, RoutedMessage)>>);
+
+    impl Handler<DeviceEpochBatch> for OutboxActor {
+        type Result = ();
+
+        fn handle(&mut self, msg: DeviceEpochBatch, _ctx: &mut Context<Self>) -> Self::Result {
+            println!("Device epoch batch: {:?}", msg)
         }
     }
 }
@@ -340,7 +400,7 @@ const OUTBOX_ACTORS: u16 = 32;
 
 pub struct AppState {
     inbox_actors: Vec<Addr<inbox::InboxActor>>,
-    outbox_actors: Vec<Addr<outbox::OutboxActor>>,
+    outbox_actors: Vec<(Addr<outbox::ReceiverActor>, Addr<outbox::OutboxActor>)>,
 }
 
 #[actix_web::main]
@@ -353,8 +413,13 @@ async fn main() -> std::io::Result<()> {
         .collect();
 
     // Boot up a set of outbox actors:
-    let outbox_actors: Vec<Addr<outbox::OutboxActor>> = (0..OUTBOX_ACTORS)
-        .map(|id| outbox::OutboxActor::new(id).start())
+    let outbox_actors: Vec<(Addr<outbox::ReceiverActor>, Addr<outbox::OutboxActor>)> = (0
+        ..OUTBOX_ACTORS)
+        .map(|id| {
+            let out_id = outbox::OutboxActor::new(id).start();
+            let rec_id = outbox::ReceiverActor::new(id, out_id.clone()).start();
+            (rec_id, out_id)
+        })
         .collect();
 
     let state = web::Data::new(AppState {
@@ -372,6 +437,7 @@ async fn main() -> std::io::Result<()> {
 
     for outbox_actor in state.outbox_actors.iter() {
         outbox_actor
+            .0
             .send(outbox::Initialize(state.clone().into_inner()))
             .await
             .unwrap();
