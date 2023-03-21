@@ -34,41 +34,53 @@ over channels with clients.
 
 A multithreaded version of central server.
 
-## [In progress] Parallel
+## [In progress] Parallel Server
 
 Use actix/erlang.
 
-Cool: everyone interacts with the same server to send messages, but has own
+Cool: everyone interacts with the same server to send messages, but has specific
 instance to receive messages from.
 
 Not cool: 
-
 
 ### Design
 
 **Request handler**
 
-Handles requests and assigns messages to incoming message actors based on the 
-sender.
+Handles requests directly from client and load balances messages to inbox actors 
+based on the sender id.
 
-**Incoming message actors**
+**Inbox**
 
-Two actos that flip states between receiving messages and sending messages.
-The sending actors forward messages to the mailboxes.
+Actor that receives messages from request handlers and fills a queue within a single epoch.
+When the epoch is started, the message queue is transferred to the router and started over.
+
+**Router**
+
+The router transforms the message queue into a hash map of vectors based on receivers.
+For each message in the message queue, the router breaks down the message bundle
+adds the inbox index to all messages in a bundle, and puts each message into a vector destined for the receiver
+responsible for the mailbox for the destination client.
+
+**Receiver**
+
+A receiver processes messages from one router at a time. The receiver puts each message into
+a vector based on the destination client. Each receiver iterates over routers in the same order.
+
+**Outbox**
+
+An outbox holds all messages destined for a client from previous epochs.
 
 **Sequencer**
 
-**Mailbox**
+A sequencer communicates with inboxes/routers to indicate epoch starts.
+All outboxes communicate with the sequencer when they receive their list of messages
+for an epoch.
+Once a sequencer receives indication from all outboxes that an epoch has been committed, it 
+sends a new epoch signal to the inboxes.
 
-### Internal Attestation
+### Client-facing Attestation of correctness
 
-Each actor in the system will sign over the message before forwarding it to the
-next actor.
-Incoming message actor needs to sign over message bundle, the epoch number, and
-the index of the bundle in its queue.
-They also have to attest to an epoch if there are no messages in it.
-
-### Client-facing Attestation
 Outgoing message actors will need to sign over the messages received for a mailbox in an epoch.
  * Global per-message seq number
  * hash of the recipients (produced by the sending client)
@@ -105,6 +117,13 @@ If a client sees a divergence in hash chains, it does the following out of band:
          * client compares with local attestation and can produce proof
    * server sad
 
+### Internal Attestation
+
+Each actor in the system will sign over the message before forwarding it to the
+next actor.
+Incoming message actor needs to sign over message bundle, the epoch number, and
+the index of the bundle in its queue.
+They also have to attest to an epoch if there are no messages in it.
 
 ### Other
 The outgoing actor can "accept blame" or find out which incoming actor is responsible for the error.
