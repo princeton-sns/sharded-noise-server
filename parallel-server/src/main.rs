@@ -1,4 +1,5 @@
 use actix::Addr;
+
 use actix_web::{error, get, http::header, post, web, App, HttpMessage, HttpServer, Responder};
 use std::sync::Arc;
 
@@ -12,9 +13,8 @@ async fn hello(name: web::Path<String>) -> impl Responder {
     format!("Hello {}!", &name)
 }
 
-#[post("/epoch/{id}")]
+#[get("/epoch/{id}")]
 async fn incr_epoch(id: web::Path<u64>, state: web::Data<AppState>) -> impl Responder {
-    // println!("Id: {}", id);
 
     for inbox_actor in state.inbox_actors.iter() {
         inbox_actor.send(inbox::EpochStart(*id)).await.unwrap();
@@ -340,7 +340,9 @@ pub mod outbox {
             msg: crate::inbox::RoutedEpochBatch,
             _ctx: &mut Context<Self>,
         ) -> Self::Result {
+            
             let inbox_id = msg.inbox_id as usize;
+            let epoch_id = msg.epoch_id as u64;
             self.input_queues[inbox_id] = Some(msg);
 
             // check if every element of input_queus has been written to
@@ -363,18 +365,19 @@ pub mod outbox {
                         device_messages.push_back((batch.epoch_id, message));
                     }
                 }
-                self.outbox_address.do_send(DeviceEpochBatch(output_map))
+                self.outbox_address.do_send(DeviceEpochBatch(epoch_id, output_map))
             }
         }
     }
 
     pub struct OutboxActor {
         id: u16,
+        sequencer: Addr<crate::sequencer::SequencerActor>,
     }
 
     impl OutboxActor {
-        pub fn new(id: u16) -> Self {
-            OutboxActor { id }
+        pub fn new(id: u16, sequencer: Addr<crate::sequencer::SequencerActor>) -> Self {
+            OutboxActor { id, sequencer }
         }
     }
 
@@ -384,28 +387,115 @@ pub mod outbox {
 
     #[derive(Message, Clone, Debug)]
     #[rtype(result = "()")]
-    pub struct DeviceEpochBatch(pub HashMap<String, LinkedList<(u64, RoutedMessage)>>);
+    pub struct DeviceEpochBatch(pub u64, pub HashMap<String, LinkedList<(u64, RoutedMessage)>>);
 
     impl Handler<DeviceEpochBatch> for OutboxActor {
         type Result = ();
 
         fn handle(&mut self, msg: DeviceEpochBatch, _ctx: &mut Context<Self>) -> Self::Result {
-            println!("Device epoch batch: {:?}", msg)
+            println!("Message: {:?}", msg);
+            self.sequencer.do_send(crate::sequencer::EndEpoch(msg.0, self.id));
         }
     }
 }
 
-const INBOX_ACTORS: u16 = 32;
-const OUTBOX_ACTORS: u16 = 32;
+pub mod sequencer {
+    use actix::{Actor, Context, Handler, Message};
+    use std::sync::Arc;
+
+    #[derive(Message, Clone)]
+    #[rtype(result = "()")]
+    pub struct Initialize(pub Arc<crate::AppState>);
+
+    pub struct SequencerActor {
+        epoch: u64,
+        outbox_signals: Vec<u16>,
+        state: Option<Arc<crate::AppState>>,
+    }
+
+    impl SequencerActor {
+        pub fn new() -> Self {
+            SequencerActor {
+                epoch: 1,
+                outbox_signals: Vec::new(),
+                state: None,
+            }
+        }
+    }
+
+    impl Actor for SequencerActor {
+        type Context = Context<Self>;
+    }
+
+    impl Handler<Initialize> for SequencerActor {
+        type Result = ();
+
+        fn handle(&mut self, msg: Initialize, _ctx: &mut Context<Self>) -> Self::Result {
+            self.state = Some(msg.0);
+
+            for inbox_actor in self.state.as_ref().unwrap().inbox_actors.iter() {
+                inbox_actor.do_send(crate::inbox::EpochStart(self.epoch));
+            }
+            
+            // Timer::after(Duration::from_secs(1)).await;
+            // TODO: need to artificially create time between first two epochs
+            // this isn't good enough
+            for i in 0..1000000 {
+                let x  = i*77 / 12;
+            }
+
+            self.epoch += 1;
+            println!("Starting epoch {:?}", self.epoch);
+            for inbox_actor in self.state.as_ref().unwrap().inbox_actors.iter() {
+                inbox_actor.do_send(crate::inbox::EpochStart(self.epoch));
+            }
+            
+        }
+    }
+
+    #[derive(Message, Clone)]
+    #[rtype(result = "()")]
+    pub struct EndEpoch(pub u64, pub u16);
+
+    impl Handler<EndEpoch> for SequencerActor {
+        type Result = ();
+
+        fn handle(&mut self, msg: EndEpoch, _ctx: &mut Context<Self>) -> Self::Result {
+            if msg.0 == self.epoch - 1 {
+                let outbox_id = msg.1 as u16;
+                if !self.outbox_signals.contains(&outbox_id){
+                    self.outbox_signals.push(outbox_id);
+                }
+
+                let num_outboxes = self.state.as_ref().unwrap().outbox_actors.len(); 
+                if self.outbox_signals.len() == num_outboxes {
+                    println!("ending epoch: {:?}", self.epoch);
+                    self.epoch += 1;
+                    println!("starting epoch: {:?}", self.epoch);
+                    self.outbox_signals = Vec::new();
+                    for inbox in self.state.as_ref().unwrap().inbox_actors.iter() {
+                        inbox.do_send(crate::inbox::EpochStart(self.epoch));
+                    }
+                }
+            }
+        }
+    }
+}
+
+const INBOX_ACTORS: u16 = 1;
+const OUTBOX_ACTORS: u16 = 1;
 
 pub struct AppState {
     inbox_actors: Vec<Addr<inbox::InboxActor>>,
     outbox_actors: Vec<(Addr<outbox::ReceiverActor>, Addr<outbox::OutboxActor>)>,
+    sequencer: Addr<sequencer::SequencerActor>,
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     use actix::{Actor, Addr};
+
+    let sequencer = sequencer::SequencerActor::new().start();
 
     // Boot up a set of inbox actors:
     let inbox_actors: Vec<Addr<inbox::InboxActor>> = (0..INBOX_ACTORS)
@@ -416,13 +506,15 @@ async fn main() -> std::io::Result<()> {
     let outbox_actors: Vec<(Addr<outbox::ReceiverActor>, Addr<outbox::OutboxActor>)> = (0
         ..OUTBOX_ACTORS)
         .map(|id| {
-            let out_id = outbox::OutboxActor::new(id).start();
+            let out_id = outbox::OutboxActor::new(id, sequencer.clone()).start();
             let rec_id = outbox::ReceiverActor::new(id, out_id.clone()).start();
             (rec_id, out_id)
         })
         .collect();
+    
 
     let state = web::Data::new(AppState {
+        sequencer: sequencer.clone(),
         inbox_actors,
         outbox_actors,
     });
@@ -432,7 +524,6 @@ async fn main() -> std::io::Result<()> {
             .send(inbox::Initialize(state.clone().into_inner()))
             .await
             .unwrap();
-        inbox_actor.send(inbox::EpochStart(0)).await.unwrap();
     }
 
     for outbox_actor in state.outbox_actors.iter() {
@@ -442,7 +533,9 @@ async fn main() -> std::io::Result<()> {
             .await
             .unwrap();
     }
-
+    
+    sequencer.send(sequencer::Initialize(state.clone().into_inner())).await.unwrap();
+    
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
