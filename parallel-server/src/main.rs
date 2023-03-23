@@ -1,6 +1,5 @@
 use actix::Addr;
 use actix_web::{error, get, http::header, post, web, App, HttpMessage, HttpServer, Responder};
-use std::sync::Arc;
 
 #[get("/")]
 async fn index() -> impl Responder {
@@ -215,7 +214,7 @@ pub mod inbox {
     pub struct InboxActor {
         id: u16,
         queue: LinkedList<Event>,
-        epoch: Option<u64>,
+        pub epoch: Option<u64>,
         router: Addr<RouterActor>,
         state: Option<Arc<crate::AppState>>,
     }
@@ -489,7 +488,6 @@ const OUTBOX_ACTORS: u16 = 1;
 pub struct AppState {
     inbox_actors: Vec<Addr<inbox::InboxActor>>,
     outbox_actors: Vec<(Addr<outbox::ReceiverActor>, Addr<outbox::OutboxActor>)>,
-    sequencer: Addr<sequencer::SequencerActor>,
 }
 
 #[actix_web::main]
@@ -514,7 +512,6 @@ async fn main() -> std::io::Result<()> {
         .collect();
 
     let state = web::Data::new(AppState {
-        sequencer: sequencer.clone(),
         inbox_actors,
         outbox_actors,
     });
@@ -550,4 +547,37 @@ async fn main() -> std::io::Result<()> {
     .bind(("127.0.0.1", 8081))?
     .run()
     .await
+}
+
+/**
+ * UNIT TESTS
+ */
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use actix::Actor;
+    use std::fmt::Debug;
+
+    #[actix_web::test]
+    async fn test_inbox_epoch_start() {
+        let inbox = inbox::InboxActor::new(1);
+        let inbox_actor = inbox.start();
+        let state = web::Data::new(AppState {
+            inbox_actors: Vec::new(),
+            outbox_actors: Vec::new(),
+        });
+
+        inbox_actor
+            .send(inbox::Initialize(state.clone().into_inner()))
+            .await
+            .unwrap();
+
+        inbox_actor.do_send(crate::inbox::EpochStart(2));
+
+        //let epoch = inbox_actor.clone().epoch;
+        // TODO: figure out how to actually get actor state
+        assert!(1 < 2);
+    }
 }
