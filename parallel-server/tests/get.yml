@@ -1,0 +1,31 @@
+---
+
+concurrency: 100
+base: 'http://localhost:8081'
+iterations: 1000000
+rampup: 2
+
+plan:
+  - name: Post message A
+    request:
+      method: POST
+      headers:
+        Authorization: "Bearer a"
+      body:  '[{"deviceId": "b", "payload": { "cType": 0, "ciphertext": "knock knock"}}]'
+      url: /message
+
+        
+  - name: Post message B
+    request:
+      method: POST
+      headers:
+        Authorization: "Bearer B"
+      body:  '[{"deviceId": "a", "payload": { "cType": 0, "ciphertext": "whos there"}}]'
+      url: /message
+
+  - name: Get message
+    request:
+      method: GET
+      headers:
+        Authorization: "Bearer a"
+      url: /message

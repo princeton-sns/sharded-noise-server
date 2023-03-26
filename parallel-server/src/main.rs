@@ -393,7 +393,6 @@ pub mod outbox {
         type Result = ();
 
         fn handle(&mut self, msg: DeviceEpochBatch, _ctx: &mut Context<Self>) -> Self::Result {
-            println!("Message: {:?}", msg);
             self.sequencer
                 .do_send(crate::sequencer::EndEpoch(msg.0, self.id));
         }
@@ -446,7 +445,6 @@ pub mod sequencer {
             }
 
             self.epoch += 1;
-            println!("Starting epoch {:?}", self.epoch);
             for inbox_actor in self.state.as_ref().unwrap().inbox_actors.iter() {
                 inbox_actor.do_send(crate::inbox::EpochStart(self.epoch));
             }
@@ -469,9 +467,7 @@ pub mod sequencer {
 
                 let num_outboxes = self.state.as_ref().unwrap().outbox_actors.len();
                 if self.outbox_signals.len() == num_outboxes {
-                    println!("ending epoch: {:?}", self.epoch);
                     self.epoch += 1;
-                    println!("starting epoch: {:?}", self.epoch);
                     self.outbox_signals = Vec::new();
                     for inbox in self.state.as_ref().unwrap().inbox_actors.iter() {
                         inbox.do_send(crate::inbox::EpochStart(self.epoch));
@@ -547,37 +543,4 @@ async fn main() -> std::io::Result<()> {
     .bind(("127.0.0.1", 8081))?
     .run()
     .await
-}
-
-/**
- * UNIT TESTS
- */
-
-#[cfg(test)]
-mod tests {
-
-    use super::*;
-    use actix::Actor;
-    use std::fmt::Debug;
-
-    #[actix_web::test]
-    async fn test_inbox_epoch_start() {
-        let inbox = inbox::InboxActor::new(1);
-        let inbox_actor = inbox.start();
-        let state = web::Data::new(AppState {
-            inbox_actors: Vec::new(),
-            outbox_actors: Vec::new(),
-        });
-
-        inbox_actor
-            .send(inbox::Initialize(state.clone().into_inner()))
-            .await
-            .unwrap();
-
-        inbox_actor.do_send(crate::inbox::EpochStart(2));
-
-        //let epoch = inbox_actor.clone().epoch;
-        // TODO: figure out how to actually get actor state
-        assert!(1 < 2);
-    }
 }
