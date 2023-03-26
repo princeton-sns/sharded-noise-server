@@ -2,7 +2,6 @@ use actix::Addr;
 use actix_web::{
     delete, error, get, http::header, post, web, App, HttpMessage, HttpServer, Responder,
 };
-use std::sync::Arc;
 
 #[get("/")]
 async fn index() -> impl Responder {
@@ -23,7 +22,7 @@ async fn incr_epoch(id: web::Path<u64>, state: web::Data<AppState>) -> impl Resp
     ""
 }
 
-struct BearerToken(String);
+pub struct BearerToken(String);
 
 impl BearerToken {
     pub fn token(&self) -> &str {
@@ -180,12 +179,11 @@ pub mod inbox {
 
     struct RouterActor {
         id: u16,
-        epoch: Option<InboxEpoch>,
     }
 
     impl RouterActor {
         pub fn new(id: u16) -> Self {
-            RouterActor { id, epoch: None }
+            RouterActor { id }
         }
     }
 
@@ -241,7 +239,7 @@ pub mod inbox {
     }
 
     pub struct InboxActor {
-        id: u16,
+        _id: u16,
         queue: LinkedList<Event>,
         epoch: Option<u64>,
         router: Addr<RouterActor>,
@@ -253,7 +251,7 @@ pub mod inbox {
             let router = RouterActor::new(id).start();
 
             InboxActor {
-                id,
+                _id: id,
                 queue: LinkedList::new(),
                 epoch: None,
                 router,
@@ -328,7 +326,7 @@ pub mod outbox {
     pub struct Initialize(pub Arc<crate::AppState>);
 
     pub struct ReceiverActor {
-        id: u16,
+        _id: u16,
         outbox_address: Addr<OutboxActor>,
         state: Option<Arc<crate::AppState>>,
         input_queues: Vec<Option<RoutedEpochBatch>>,
@@ -337,7 +335,7 @@ pub mod outbox {
     impl ReceiverActor {
         pub fn new(id: u16, outbox_address: Addr<OutboxActor>) -> Self {
             ReceiverActor {
-                id,
+                _id: id,
                 outbox_address,
                 state: None,
                 input_queues: Vec::new(),
@@ -380,8 +378,7 @@ pub mod outbox {
                 .into_iter()
                 {
                     let batch = b.unwrap();
-                    let inbox_id = batch.inbox_id;
-                    for mut message in batch.messages.into_iter() {
+                    for message in batch.messages.into_iter() {
                         let device_messages = output_map
                             .entry(message.payload.device_id.clone())
                             .or_insert_with(|| LinkedList::new());
@@ -516,9 +513,9 @@ pub mod sequencer {
             // Timer::after(Duration::from_secs(1)).await;
             // TODO: need to artificially create time between first two epochs
             // this isn't good enough
-            for i in 0..1000000 {
-                let x = i * 77 / 12;
-            }
+            // for i in 0..1000000 {
+            //     let x = i * 77 / 12;
+            // }
 
             self.epoch += 1;
             println!("Starting epoch {:?}", self.epoch);
@@ -563,7 +560,7 @@ const OUTBOX_ACTORS: u16 = 32;
 pub struct AppState {
     inbox_actors: Vec<Addr<inbox::InboxActor>>,
     outbox_actors: Vec<(Addr<outbox::ReceiverActor>, Addr<outbox::OutboxActor>)>,
-    sequencer: Addr<sequencer::SequencerActor>,
+    _sequencer: Addr<sequencer::SequencerActor>,
 }
 
 #[actix_web::main]
@@ -588,7 +585,7 @@ async fn main() -> std::io::Result<()> {
         .collect();
 
     let state = web::Data::new(AppState {
-        sequencer: sequencer.clone(),
+        _sequencer: sequencer.clone(),
         inbox_actors,
         outbox_actors,
     });
