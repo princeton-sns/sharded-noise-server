@@ -1,5 +1,7 @@
 use actix::Addr;
-use actix_web::{error, get, http::header, post, web, App, HttpMessage, HttpServer, Responder};
+use actix_web::{
+    delete, error, get, http::header, post, web, App, HttpMessage, HttpServer, Responder,
+};
 
 #[get("/")]
 async fn index() -> impl Responder {
@@ -20,7 +22,7 @@ async fn incr_epoch(id: web::Path<u64>, state: web::Data<AppState>) -> impl Resp
     ""
 }
 
-struct BearerToken(String);
+pub struct BearerToken(String);
 
 impl BearerToken {
     pub fn token(&self) -> &str {
@@ -70,19 +72,12 @@ async fn handle_message(
     state: web::Data<AppState>,
     auth: web::Header<BearerToken>,
 ) -> impl Responder {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let inbox_actors_cnt = state.inbox_actors.len();
-
-    // Hash the sender_id to determine the corresponding inbox actor
     let sender_id = auth.into_inner().into_token();
-    let mut sender_hasher = DefaultHasher::new();
-    sender_id.hash(&mut sender_hasher);
-    let actor_idx = sender_hasher.finish() % (inbox_actors_cnt as u64);
+    let inbox_actors_cnt = state.inbox_actors.len();
+    let actor_idx = hash_into_bucket(&sender_id, inbox_actors_cnt);
 
     // Now, send the message to the corresponding actor:
-    let epoch = state.inbox_actors[actor_idx as usize]
+    let epoch = state.inbox_actors[actor_idx]
         .send(inbox::Event {
             sender: sender_id,
             bundle: bundle.into_inner(),
@@ -94,17 +89,35 @@ async fn handle_message(
     web::Json::<u64>(epoch)
 }
 
-pub mod protocol {
-    use serde::Deserialize;
+#[delete("/outbox")]
+async fn retrieve_messages(
+    state: web::Data<AppState>,
+    auth: web::Header<BearerToken>,
+) -> impl Responder {
+    let device_id = auth.into_inner().into_token();
+    let outbox_actors_cnt = state.outbox_actors.len();
+    let actor_idx = hash_into_bucket(&device_id, outbox_actors_cnt);
 
-    #[derive(Debug, Deserialize, Clone)]
+    let messages = state.outbox_actors[actor_idx]
+        .1
+        .send(outbox::GetDeviceMessages(device_id))
+        .await
+        .unwrap();
+
+    web::Json(messages.0)
+}
+
+pub mod protocol {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Serialize, Deserialize, Clone)]
     #[serde(rename_all = "camelCase")]
     pub struct Payload {
         pub c_type: usize,
         pub ciphertext: String,
     }
 
-    #[derive(Debug, Deserialize, Clone)]
+    #[derive(Debug, Serialize, Deserialize, Clone)]
     #[serde(rename_all = "camelCase")]
     pub struct Message {
         pub device_id: String,
@@ -115,6 +128,15 @@ pub mod protocol {
     #[serde(rename_all = "camelCase")]
     pub struct Bundle {
         pub batch: Vec<Message>,
+    }
+
+    #[derive(Debug, Serialize, Clone)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OutboxMessage {
+        pub sender: String,
+        pub receivers: Vec<String>,
+        pub payload: Message,
+        pub seq: (u64, u64),
     }
 }
 
@@ -147,30 +169,21 @@ pub mod inbox {
     #[derive(Message)]
     #[rtype(result = "()")]
     pub struct InboxEpoch(pub Arc<crate::AppState>, pub u64, pub LinkedList<Event>);
-
-    #[derive(Debug, Clone)]
-    pub struct RoutedMessage {
-        pub sender: String,
-        pub payload: crate::protocol::Message,
-        pub inbox_index: u64,
-    }
-
     #[derive(Message, Clone, Debug)]
     #[rtype(result = "()")]
     pub struct RoutedEpochBatch {
         pub epoch_id: u64,
         pub inbox_id: u16,
-        pub messages: LinkedList<RoutedMessage>,
+        pub messages: LinkedList<crate::protocol::OutboxMessage>,
     }
 
     struct RouterActor {
         id: u16,
-        epoch: Option<InboxEpoch>,
     }
 
     impl RouterActor {
         pub fn new(id: u16) -> Self {
-            RouterActor { id, epoch: None }
+            RouterActor { id }
         }
     }
 
@@ -184,22 +197,36 @@ pub mod inbox {
         fn handle(&mut self, msg: InboxEpoch, _ctx: &mut Context<Self>) {
             let InboxEpoch(state, epoch_id, queue) = msg;
 
-            let mut mailboxes = vec![LinkedList::new(); state.outbox_actors.len()];
+            let mut outboxes = vec![LinkedList::new(); state.outbox_actors.len()];
 
             for (idx, ev) in queue.into_iter().enumerate() {
+                let receivers: Vec<_> = ev
+                    .bundle
+                    .batch
+                    .iter()
+                    .map(|m| m.device_id.clone())
+                    .collect();
+
                 for message in ev.bundle.batch.into_iter() {
-                    let bucket = hash_into_bucket(&message.device_id, mailboxes.len());
-                    let rt_msg = RoutedMessage {
+                    let bucket = hash_into_bucket(&message.device_id, outboxes.len());
+
+                    let seq = (
+                        epoch_id,
+                        ((idx as u64) & 0x0000FFFFFFFFFFFF) | ((self.id as u64) << 48),
+                    );
+
+                    let rt_msg = crate::protocol::OutboxMessage {
                         sender: ev.sender.clone(),
+                        receivers: receivers.clone(),
                         payload: message,
-                        inbox_index: idx as u64,
+                        seq,
                     };
 
-                    mailboxes[bucket].push_back(rt_msg);
+                    outboxes[bucket].push_back(rt_msg);
                 }
             }
 
-            for (messages, outbox) in mailboxes.into_iter().zip(state.outbox_actors.iter()) {
+            for (messages, outbox) in outboxes.into_iter().zip(state.outbox_actors.iter()) {
                 let routed_batch = RoutedEpochBatch {
                     epoch_id,
                     inbox_id: self.id,
@@ -212,7 +239,7 @@ pub mod inbox {
     }
 
     pub struct InboxActor {
-        id: u16,
+        _id: u16,
         queue: LinkedList<Event>,
         pub epoch: Option<u64>,
         router: Addr<RouterActor>,
@@ -224,7 +251,7 @@ pub mod inbox {
             let router = RouterActor::new(id).start();
 
             InboxActor {
-                id,
+                _id: id,
                 queue: LinkedList::new(),
                 epoch: None,
                 router,
@@ -288,8 +315,8 @@ pub mod inbox {
 }
 
 pub mod outbox {
-    use crate::inbox::{RoutedEpochBatch, RoutedMessage};
-    use actix::{Actor, Addr, Context, Handler, Message};
+    use crate::inbox::RoutedEpochBatch;
+    use actix::{Actor, Addr, Context, Handler, Message, MessageResponse};
     use std::collections::{HashMap, LinkedList};
     use std::mem;
     use std::sync::Arc;
@@ -299,7 +326,7 @@ pub mod outbox {
     pub struct Initialize(pub Arc<crate::AppState>);
 
     pub struct ReceiverActor {
-        id: u16,
+        _id: u16,
         outbox_address: Addr<OutboxActor>,
         state: Option<Arc<crate::AppState>>,
         input_queues: Vec<Option<RoutedEpochBatch>>,
@@ -308,7 +335,7 @@ pub mod outbox {
     impl ReceiverActor {
         pub fn new(id: u16, outbox_address: Addr<OutboxActor>) -> Self {
             ReceiverActor {
-                id,
+                _id: id,
                 outbox_address,
                 state: None,
                 input_queues: Vec::new(),
@@ -351,14 +378,11 @@ pub mod outbox {
                 .into_iter()
                 {
                     let batch = b.unwrap();
-                    let inbox_id = batch.inbox_id;
-                    for mut message in batch.messages.into_iter() {
-                        message.inbox_index =
-                            (message.inbox_index & 0x0000FFFFFFFFFFFF) | ((inbox_id as u64) << 48);
+                    for message in batch.messages.into_iter() {
                         let device_messages = output_map
                             .entry(message.payload.device_id.clone())
                             .or_insert_with(|| LinkedList::new());
-                        device_messages.push_back((batch.epoch_id, message));
+                        device_messages.push_back(message);
                     }
                 }
                 self.outbox_address
@@ -370,11 +394,21 @@ pub mod outbox {
     pub struct OutboxActor {
         id: u16,
         sequencer: Addr<crate::sequencer::SequencerActor>,
+        next_epoch: u64,
+        // Mapping from device key to the next epoch which has not
+        // been exposed to the client, and all messages from including
+        // this message)
+        client_mailboxes: HashMap<String, (u64, LinkedList<crate::protocol::OutboxMessage>)>,
     }
 
     impl OutboxActor {
         pub fn new(id: u16, sequencer: Addr<crate::sequencer::SequencerActor>) -> Self {
-            OutboxActor { id, sequencer }
+            OutboxActor {
+                id,
+                sequencer,
+                next_epoch: 0,
+                client_mailboxes: HashMap::new(),
+            }
         }
     }
 
@@ -386,15 +420,53 @@ pub mod outbox {
     #[rtype(result = "()")]
     pub struct DeviceEpochBatch(
         pub u64,
-        pub HashMap<String, LinkedList<(u64, RoutedMessage)>>,
+        pub HashMap<String, LinkedList<crate::protocol::OutboxMessage>>,
     );
+
+    #[derive(MessageResponse)]
+    pub struct DeviceMessages(pub LinkedList<crate::protocol::OutboxMessage>);
+
+    #[derive(Message, Clone, Debug)]
+    #[rtype(result = "DeviceMessages")]
+    pub struct GetDeviceMessages(pub String);
 
     impl Handler<DeviceEpochBatch> for OutboxActor {
         type Result = ();
 
-        fn handle(&mut self, msg: DeviceEpochBatch, _ctx: &mut Context<Self>) -> Self::Result {
+        fn handle(
+            &mut self,
+            epoch_batch: DeviceEpochBatch,
+            _ctx: &mut Context<Self>,
+        ) -> Self::Result {
+            let DeviceEpochBatch(epoch_id, device_messages) = epoch_batch;
+
+            for (device, mut messages) in device_messages.into_iter() {
+                if let Some((_, ref mut device_mailbox)) = self.client_mailboxes.get_mut(&device) {
+                    device_mailbox.append(&mut messages);
+                } else {
+                    self.client_mailboxes.insert(device, (0, messages));
+                }
+            }
+
+            self.next_epoch = epoch_id + 1;
             self.sequencer
-                .do_send(crate::sequencer::EndEpoch(msg.0, self.id));
+                .do_send(crate::sequencer::EndEpoch(epoch_id, self.id));
+        }
+    }
+
+    impl Handler<GetDeviceMessages> for OutboxActor {
+        type Result = DeviceMessages;
+
+        fn handle(&mut self, msg: GetDeviceMessages, _ctx: &mut Context<Self>) -> Self::Result {
+            let (ref mut client_next_epoch, ref mut client_msgs) = self
+                .client_mailboxes
+                .entry(msg.0)
+                .or_insert_with(|| (0, LinkedList::new()));
+
+            *client_next_epoch = self.next_epoch;
+
+            let msgs = mem::replace(client_msgs, LinkedList::new());
+            DeviceMessages(msgs)
         }
     }
 }
@@ -440,9 +512,9 @@ pub mod sequencer {
             // Timer::after(Duration::from_secs(1)).await;
             // TODO: need to artificially create time between first two epochs
             // this isn't good enough
-            for i in 0..1000000 {
-                let x = i * 77 / 12;
-            }
+            // for i in 0..1000000 {
+            //     let x = i * 77 / 12;
+            // }
 
             self.epoch += 1;
             for inbox_actor in self.state.as_ref().unwrap().inbox_actors.iter() {
@@ -478,12 +550,13 @@ pub mod sequencer {
     }
 }
 
-const INBOX_ACTORS: u16 = 1;
-const OUTBOX_ACTORS: u16 = 1;
+const INBOX_ACTORS: u16 = 32;
+const OUTBOX_ACTORS: u16 = 32;
 
 pub struct AppState {
     inbox_actors: Vec<Addr<inbox::InboxActor>>,
     outbox_actors: Vec<(Addr<outbox::ReceiverActor>, Addr<outbox::OutboxActor>)>,
+    _sequencer: Addr<sequencer::SequencerActor>,
 }
 
 #[actix_web::main]
@@ -508,6 +581,7 @@ async fn main() -> std::io::Result<()> {
         .collect();
 
     let state = web::Data::new(AppState {
+        _sequencer: sequencer.clone(),
         inbox_actors,
         outbox_actors,
     });
@@ -538,6 +612,7 @@ async fn main() -> std::io::Result<()> {
             .service(index)
             .service(hello)
             .service(handle_message)
+            .service(retrieve_messages)
             .service(incr_epoch)
     })
     .bind(("127.0.0.1", 8081))?
