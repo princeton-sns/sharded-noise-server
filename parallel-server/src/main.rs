@@ -1,7 +1,4 @@
-use actix::Addr;
-use actix_web::{
-    delete, error, get, http::header, post, web, App, HttpMessage, HttpServer, Responder,
-};
+use actix_web::{App, HttpServer};
 use clap::{Parser, Subcommand};
 
 pub mod sequencer;
@@ -12,6 +9,9 @@ enum Commands {
     Sequencer {
         #[arg(long)]
         port: u16,
+
+        #[arg(long)]
+        shard_count: u8,
     },
 
     Shard {
@@ -44,8 +44,13 @@ async fn main() -> std::io::Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Commands::Sequencer { port } => {
-            unimplemented!();
+        Commands::Sequencer { port, shard_count } => {
+            let app_closure = sequencer::init(shard_count).await;
+
+            HttpServer::new(move || App::new().configure(app_closure.clone()))
+                .bind(("0.0.0.0", port))?
+                .run()
+                .await
         }
 
         Commands::Shard {

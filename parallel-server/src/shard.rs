@@ -1,9 +1,8 @@
 use actix::{Actor, Addr};
 use actix_web::{
-    delete, error, get, http::header, post, web, App, HttpMessage, HttpResponse, HttpServer,
-    Responder,
+    delete, error, get, http::header, post, web, HttpMessage, HttpResponse, Responder,
 };
-use std::io;
+
 use tokio::time::{sleep, Duration};
 
 pub mod client_protocol {
@@ -225,10 +224,10 @@ pub mod inbox {
 }
 
 pub mod intershard {
-    use actix::{Actor, Addr, Context, Handler, Message, MessageResponse, ResponseFuture};
+    use actix::{Actor, Context, Handler, Message, ResponseFuture};
     use serde::{Deserialize, Serialize};
-    use std::collections::{HashMap, LinkedList};
-    use std::mem;
+    use std::collections::LinkedList;
+
     use std::sync::Arc;
 
     #[derive(Message, Serialize, Deserialize, Clone, Debug)]
@@ -427,7 +426,7 @@ pub mod intershard {
                 Box::pin(async move {
                     httpc
                         .post(format!("{}/end-epoch", seq_url))
-                        .json(&crate::sequencer::EndEpochRequest {
+                        .json(&crate::sequencer::EndEpochReq {
                             shard_id: self_shard_id,
                             epoch_id: epoch,
                         })
@@ -532,6 +531,7 @@ pub mod outbox {
         // been exposed to the client, and all messages from including
         // this message)
         client_mailboxes: HashMap<String, (u64, LinkedList<super::client_protocol::OutboxMessage>)>,
+        state: Option<Arc<super::ShardState>>,
     }
 
     impl OutboxActor {
@@ -540,6 +540,7 @@ pub mod outbox {
                 id,
                 next_epoch: 0,
                 client_mailboxes: HashMap::new(),
+                state: None,
             }
         }
     }
@@ -562,6 +563,14 @@ pub mod outbox {
     #[rtype(result = "DeviceMessages")]
     pub struct GetDeviceMessages(pub String);
 
+    impl Handler<Initialize> for OutboxActor {
+        type Result = ();
+
+        fn handle(&mut self, msg: Initialize, _ctx: &mut Context<Self>) -> Self::Result {
+            self.state = Some(msg.0);
+        }
+    }
+
     impl Handler<DeviceEpochBatch> for OutboxActor {
         type Result = ();
 
@@ -582,8 +591,11 @@ pub mod outbox {
 
             self.next_epoch = epoch_id + 1;
 
-            self.epoch_collector_actor
-                .do_send(crate::intershard::EndEpoch(epoch_id, self.id));
+            self.state
+                .as_ref()
+                .unwrap()
+                .epoch_collector_actor
+                .do_send(super::outbox::EndEpoch(epoch_id, self.id));
         }
     }
 
@@ -705,7 +717,7 @@ async fn retrieve_messages(
 #[post("/epoch/{epoch_id}")]
 async fn start_epoch(state: web::Data<ShardState>, epoch_id: web::Path<u64>) -> impl Responder {
     for inbox in state.inbox_actors.iter() {
-        inbox.send(inbox::EpochStart(*epoch_id));
+        inbox.do_send(inbox::EpochStart(*epoch_id));
     }
     ""
 }
@@ -766,7 +778,7 @@ pub async fn init(
 
     // Now, wait until all shards have been registered at the sequencer and get
     // their IDs:
-    let mut shard_map_opt: Option<crate::sequencer::SequencerShardMap> = None;
+    let mut shard_map_opt: Option<crate::sequencer::SequencerShardMapResp> = None;
     println!("Trying to retrieve shard map, this will loop until the expected number of shards have registered...");
     while shard_map_opt.is_none() {
         let resp = httpc
@@ -776,18 +788,18 @@ pub async fn init(
 
         if let Ok(res) = resp {
             shard_map_opt = Some(
-                res.json::<crate::sequencer::SequencerShardMap>()
+                res.json::<crate::sequencer::SequencerShardMapResp>()
                     .await
                     .unwrap(),
             );
         } else {
             print!(".");
-            io::stdout().flush();
-            sleep(Duration::from_millis(500));
+            io::stdout().flush().unwrap();
+            sleep(Duration::from_millis(500)).await;
         }
     }
     println!("Retrieved shard map!");
-    let shard_map = shard_map_opt.unwrap();
+    let shard_map = shard_map_opt.unwrap().shards;
 
     // Boot up a set of inbox actors:
     let inbox_actors: Vec<Addr<inbox::InboxActor>> = (0..inbox_count)
@@ -796,7 +808,6 @@ pub async fn init(
 
     // Boot up a set of intershard routers:
     let intershard_router_actors: Vec<Addr<intershard::InterShardRouterActor>> = (0..shard_map
-        .shards
         .len())
         .map(|id| intershard::InterShardRouterActor::new(register_resp.shard_id, id as u8).start())
         .collect();
@@ -818,7 +829,7 @@ pub async fn init(
         httpc,
         sequencer_url: sequencer_base_url,
         shard_id: register_resp.shard_id,
-        shard_map: shard_map.shards,
+        shard_map,
         inbox_actors,
         intershard_router_actors,
         outbox_actors,
@@ -842,6 +853,11 @@ pub async fn init(
     for outbox_actor in state.outbox_actors.iter() {
         outbox_actor
             .0
+            .send(outbox::Initialize(state.clone().into_inner()))
+            .await
+            .unwrap();
+        outbox_actor
+            .1
             .send(outbox::Initialize(state.clone().into_inner()))
             .await
             .unwrap();

@@ -1,82 +1,5 @@
-use actix::{Actor, Context, Handler, Message};
-use std::sync::Arc;
-
-// #[derive(Message, Clone)]
-// #[rtype(result = "()")]
-// pub struct Initialize(pub Arc<crate::AppState>);
-
-// pub struct SequencerActor {
-//     epoch: u64,
-//     outbox_signals: Vec<u16>,
-//     state: Option<Arc<crate::AppState>>,
-// }
-
-// impl SequencerActor {
-//     pub fn new() -> Self {
-//         SequencerActor {
-//             epoch: 1,
-//             outbox_signals: Vec::new(),
-//             state: None,
-//         }
-//     }
-// }
-
-// impl Actor for SequencerActor {
-//     type Context = Context<Self>;
-// }
-
-// impl Handler<Initialize> for SequencerActor {
-//     type Result = ();
-
-//     fn handle(&mut self, msg: Initialize, _ctx: &mut Context<Self>) -> Self::Result {
-//         self.state = Some(msg.0);
-
-//         for inbox_actor in self.state.as_ref().unwrap().inbox_actors.iter() {
-//             inbox_actor.do_send(crate::inbox::EpochStart(self.epoch));
-//         }
-
-//         // Timer::after(Duration::from_secs(1)).await;
-//         // TODO: need to artificially create time between first two epochs
-//         // this isn't good enough
-//         // for i in 0..1000000 {
-//         //     let x = i * 77 / 12;
-//         // }
-
-//         self.epoch += 1;
-//         println!("Starting epoch {:?}", self.epoch);
-//         for inbox_actor in self.state.as_ref().unwrap().inbox_actors.iter() {
-//             inbox_actor.do_send(crate::inbox::EpochStart(self.epoch));
-//         }
-//     }
-// }
-
-// #[derive(Message, Clone)]
-// #[rtype(result = "()")]
-// pub struct EndEpoch(pub u64, pub u16);
-
-// impl Handler<EndEpoch> for SequencerActor {
-//     type Result = ();
-
-//     fn handle(&mut self, msg: EndEpoch, _ctx: &mut Context<Self>) -> Self::Result {
-//         if msg.0 == self.epoch - 1 {
-//             let outbox_id = msg.1 as u16;
-//             if !self.outbox_signals.contains(&outbox_id) {
-//                 self.outbox_signals.push(outbox_id);
-//             }
-
-//             let num_outboxes = self.state.as_ref().unwrap().outbox_actors.len();
-//             if self.outbox_signals.len() == num_outboxes {
-//                 println!("ending epoch: {:?}", self.epoch);
-//                 self.epoch += 1;
-//                 println!("starting epoch: {:?}", self.epoch);
-//                 self.outbox_signals = Vec::new();
-//                 for inbox in self.state.as_ref().unwrap().inbox_actors.iter() {
-//                     inbox.do_send(crate::inbox::EpochStart(self.epoch));
-//                 }
-//             }
-//         }
-//     }
-// }
+use actix::{Actor, AsyncContext, Context, Handler, Message, MessageResponse, ResponseFuture};
+use actix_web::web;
 use serde::{Deserialize, Serialize};
 
 #[derive(Message, Serialize, Deserialize, Clone, Debug)]
@@ -112,10 +35,9 @@ pub struct SequencerShardMapReq;
 #[rtype(result = "()")]
 pub struct ProbeShards;
 
-use actix::{Actor, Addr, Context, Handler, Message, MessageResponse};
-use std::collections::{HashMap, LinkedList};
-use std::mem;
-use std::sync::Arc;
+#[derive(Message, Clone, Debug)]
+#[rtype(result = "()")]
+pub struct EpochStart(u64);
 
 enum Phase {
     Registration,
@@ -123,15 +45,10 @@ enum Phase {
     Sequencing(u64),
 }
 
-#[derive(Message, Clone)]
-#[rtype(result = "()")]
-pub struct Initialize(pub Arc<super::ShardState>);
-
 pub struct SequencerActor {
     num_shards: u8,
     shard_addresses: Vec<String>,
     phase: Phase,
-
 }
 
 impl SequencerActor {
@@ -150,58 +67,76 @@ impl Actor for SequencerActor {
 
 impl Handler<SequencerRegisterReq> for SequencerActor {
     type Result = SequencerRegisterResp;
-    
-    fn handle(&mut self, msg: SequencerRegisterReq, ctx: Context<Self>) -> SequencerRegisterResp {
-        self.shard_addresses.push_back(msg.base_url);
 
-        if self.shard_addresses.len() == self.num_shards {
-            ctx.notify_later(ProbeShards, duration::from_secs(1));
+    fn handle(
+        &mut self,
+        msg: SequencerRegisterReq,
+        ctx: &mut Context<Self>,
+    ) -> SequencerRegisterResp {
+        self.shard_addresses.push(msg.base_url);
+
+        if self.shard_addresses.len() == self.num_shards as usize {
+            ctx.notify_later(ProbeShards, std::time::Duration::from_secs(1));
             self.phase = Phase::Bootup;
         }
 
-        SequencerRegisterResp { shard_id: self.shard_addresses.len() - 1 }
+        SequencerRegisterResp {
+            shard_id: (self.shard_addresses.len() - 1) as u8,
+        }
     }
 }
 
 impl Handler<ProbeShards> for SequencerActor {
-    type Result = ();
+    type Result = ResponseFuture<()>;
 
-    fn handle(&mut self, _msg: ProbeShards, ctx: Context<Self>) {
-    
+    fn handle(&mut self, _msg: ProbeShards, ctx: &mut Context<Self>) -> Self::Result {
         let adds = self.shard_addresses.clone();
-        let this = ctx.address.clone()
+        let this = ctx.address().clone();
 
         Box::pin(async move {
-
-            let httpc = reqwest::Client();
+            let httpc = reqwest::Client::new();
             for addr in adds {
-                if let Err(_) = httpc.get(addr).await {
-                    tokio::sleep(tokio::Duration::from_sec(1)).await;
+                if let Err(_) = httpc.get(addr).send().await {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                     this.do_send(ProbeShards);
-                    return
+                    return;
                 }
             }
 
             this.do_send(EpochStart(0));
         })
     }
-
 }
 
+impl Handler<EpochStart> for SequencerActor {
+    type Result = ResponseFuture<()>;
 
-pub async fn init() -> impl Fn(&mut web::ServiceConfig) + Clone + Send + 'static {
-    use std::io::{self, Write};
+    fn handle(&mut self, msg: EpochStart, ctx: &mut Context<Self>) -> Self::Result {
+        let EpochStart(epoch_id) = msg;
+        self.phase = Phase::Sequencing(epoch_id);
+
+        let _adds = self.shard_addresses.clone();
+        let _this = ctx.address().clone();
+
+        Box::pin(async move {
+            // let httpc = reqwest::Client();
+            // for addr in adds {
+            //     if let Err(_) = httpc.get(addr).await {
+            //         tokio::sleep(tokio::Duration::from_sec(1)).await;
+            //         this.do_send(ProbeShards);
+            //         return;
+            //     }
+            // }
+
+            // this.do_send(EpochStart(0));
+        })
+    }
+}
+
+pub async fn init(num_shards: u8) -> impl Fn(&mut web::ServiceConfig) + Clone + Send + 'static {
+    let sequencer_addr = SequencerActor::new(num_shards).start();
 
     Box::new(move |service_config: &mut web::ServiceConfig| {
-        service_config
-            .app_data(state.clone())
-            // Client API
-            .service(handle_message)
-            .service(retrieve_messages)
-            // Sequencer API
-            .service(start_epoch)
-            .service(index)
-            // Intershard API
-            .service(intershard_batch);
+        service_config.app_data(web::Data::new(sequencer_addr.clone()));
     })
 }
