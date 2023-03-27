@@ -2,76 +2,66 @@ use actix::Addr;
 use actix_web::{
     delete, error, get, http::header, post, web, App, HttpMessage, HttpServer, Responder,
 };
+use clap::{Parser, Subcommand};
 
 pub mod sequencer;
 pub mod shard;
 
-// const INBOX_ACTORS: u16 = 32;
-// const OUTBOX_ACTORS: u16 = 32;
+#[derive(Subcommand, Debug)]
+enum Commands {
+    Sequencer {
+        #[arg(long)]
+        port: u16,
+    },
 
-// pub struct AppState {
-//     inbox_actors: Vec<Addr<inbox::InboxActor>>,
-//     outbox_actors: Vec<(Addr<outbox::ReceiverActor>, Addr<outbox::OutboxActor>)>,
-//     sequencer: Addr<sequencer::SequencerActor>,
-// }
+    Shard {
+        #[arg(long)]
+        port: u16,
+
+        #[arg(long)]
+        public_url: String,
+
+        #[arg(long)]
+        sequencer_url: String,
+
+        #[arg(long)]
+        inbox_count: u8,
+
+        #[arg(long)]
+        outbox_count: u8,
+    },
+}
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[command(subcommand)]
+    command: Commands,
+}
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // use actix::{Actor, Addr};
+    let args = Args::parse();
 
-    // let sequencer = sequencer::SequencerActor::new().start();
+    match args.command {
+        Commands::Sequencer { port } => {
+            unimplemented!();
+        }
 
-    // // Boot up a set of inbox actors:
-    // let inbox_actors: Vec<Addr<shard::inbox::InboxActor>> = (0..INBOX_ACTORS)
-    //     .map(|id| inbox::InboxActor::new(id).start())
-    //     .collect();
+        Commands::Shard {
+            port,
+            public_url,
+            sequencer_url,
+            inbox_count,
+            outbox_count,
+        } => {
+            let app_closure =
+                shard::init(public_url, sequencer_url, inbox_count, outbox_count).await;
 
-    // // Boot up a set of outbox actors:
-    // let outbox_actors: Vec<(Addr<shard::outbox::ReceiverActor>, Addr<shard::outbox::OutboxActor>)> = (0
-    //     ..OUTBOX_ACTORS)
-    //     .map(|id| {
-    //         let out_id = shard::outbox::OutboxActor::new(id, sequencer.clone()).start();
-    //         let rec_id = shard::outbox::ReceiverActor::new(id, out_id.clone()).start();
-    //         (rec_id, out_id)
-    //     })
-    //     .collect();
-
-    // let state = web::Data::new(AppState {
-    //     _sequencer: sequencer.clone(),
-    //     inbox_actors,
-    //     outbox_actors,
-    // });
-
-    // for inbox_actor in state.inbox_actors.iter() {
-    //     inbox_actor
-    //         .send(shard::inbox::Initialize(state.clone().into_inner()))
-    //         .await
-    //         .unwrap();
-    // }
-
-    // for outbox_actor in state.outbox_actors.iter() {
-    //     outbox_actor
-    //         .0
-    //         .send(shard::outbox::Initialize(state.clone().into_inner()))
-    //         .await
-    //         .unwrap();
-    // }
-
-    // sequencer
-    //     .send(sequencer::Initialize(state.clone().into_inner()))
-    //     .await
-    //     .unwrap();
-
-    let app_closure = shard::init(
-        "http://localhost:8081".to_string(),
-        "http://localhost:8082".to_string(),
-        8,
-        8,
-    )
-    .await;
-
-    HttpServer::new(move || App::new().configure(app_closure.clone()))
-        .bind(("127.0.0.1", 8081))?
-        .run()
-        .await
+            HttpServer::new(move || App::new().configure(app_closure.clone()))
+                .bind(("0.0.0.0", port))?
+                .run()
+                .await
+        }
+    }
 }
