@@ -361,6 +361,85 @@ pub mod intershard {
             outbox.0.do_send(routed_batch);
         }
     }
+
+    pub struct EpochCollectorActor {
+        state: Option<Arc<super::ShardState>>,
+        epoch: Option<u64>,
+        input_queues: (usize, Vec<bool>),
+    }
+
+    impl EpochCollectorActor {
+        pub fn new() -> Self {
+            EpochCollectorActor {
+                state: None,
+                epoch: None,
+                input_queues: (0, vec![]),
+            }
+        }
+    }
+
+    impl Actor for EpochCollectorActor {
+        type Context = Context<Self>;
+    }
+
+    impl Handler<Initialize> for EpochCollectorActor {
+        type Result = ();
+
+        fn handle(&mut self, msg: Initialize, _ctx: &mut Context<Self>) -> Self::Result {
+            let Initialize(state) = msg;
+            self.input_queues = (0, vec![false; state.outbox_actors.len()]);
+            self.state = Some(state);
+        }
+    }
+
+    impl Handler<super::outbox::EndEpoch> for EpochCollectorActor {
+        type Result = ResponseFuture<()>;
+
+        fn handle(
+            &mut self,
+            msg: super::outbox::EndEpoch,
+            _ctx: &mut Context<Self>,
+        ) -> Self::Result {
+            let outbox_id = msg.1;
+            let epoch = msg.0;
+
+            assert!(!self.input_queues.1[outbox_id as usize]);
+            self.input_queues.1[outbox_id as usize] = true;
+            self.input_queues.0 += 1;
+
+            if let Some(cur_epoch) = self.epoch {
+                assert!(cur_epoch == epoch);
+            }
+            self.epoch = Some(epoch);
+
+            // check if every element of input_queus has been written to
+            if self.input_queues.0 == self.input_queues.1.len() {
+                let seq_url = self.state.as_ref().unwrap().sequencer_url.clone();
+                let self_shard_id = self.state.as_ref().unwrap().shard_id;
+                let httpc = self.state.as_ref().unwrap().httpc.clone();
+
+                self.input_queues = (
+                    0,
+                    vec![false; self.state.as_ref().unwrap().outbox_actors.len()],
+                );
+                self.epoch = None;
+
+                Box::pin(async move {
+                    httpc
+                        .post(format!("{}/end-epoch", seq_url))
+                        .json(&crate::sequencer::EndEpochRequest {
+                            shard_id: self_shard_id,
+                            epoch_id: epoch,
+                        })
+                        .send()
+                        .await
+                        .unwrap();
+                })
+            } else {
+                Box::pin(async move {})
+            }
+        }
+    }
 }
 
 pub mod outbox {
@@ -368,6 +447,10 @@ pub mod outbox {
     use std::collections::{HashMap, LinkedList};
     use std::mem;
     use std::sync::Arc;
+
+    #[derive(Message, Clone)]
+    #[rtype(result = "()")]
+    pub struct EndEpoch(pub u64, pub u8);
 
     #[derive(Message, Clone)]
     #[rtype(result = "()")]
@@ -499,9 +582,8 @@ pub mod outbox {
 
             self.next_epoch = epoch_id + 1;
 
-            unimplemented!()
-            // self.sequencer
-            //     .do_send(crate::sequencer::EndEpoch(epoch_id, self.id));
+            self.epoch_collector_actor
+                .do_send(crate::intershard::EndEpoch(epoch_id, self.id));
         }
     }
 
@@ -641,9 +723,11 @@ pub struct ShardState {
     httpc: reqwest::Client,
     shard_id: u8,
     shard_map: Vec<String>,
+    sequencer_url: String,
     inbox_actors: Vec<Addr<inbox::InboxActor>>,
     intershard_router_actors: Vec<Addr<intershard::InterShardRouterActor>>,
     outbox_actors: Vec<(Addr<outbox::ReceiverActor>, Addr<outbox::OutboxActor>)>,
+    epoch_collector_actor: Addr<intershard::EpochCollectorActor>,
 }
 
 pub async fn init(
@@ -661,6 +745,7 @@ pub async fn init(
         "Registering ourselves ({}) at sequencer ({}) with {}/{} inboxes/outboxes...",
         shard_base_url, sequencer_base_url, inbox_count, outbox_count
     );
+
     let register_resp = httpc
         .post(format!("{}/register", &sequencer_base_url))
         .json(&crate::sequencer::SequencerRegisterReq {
@@ -726,13 +811,18 @@ pub async fn init(
         })
         .collect();
 
+    let epoch_collector_actor: Addr<intershard::EpochCollectorActor> =
+        intershard::EpochCollectorActor::new().start();
+
     let state = web::Data::new(ShardState {
         httpc,
+        sequencer_url: sequencer_base_url,
         shard_id: register_resp.shard_id,
         shard_map: shard_map.shards,
         inbox_actors,
         intershard_router_actors,
         outbox_actors,
+        epoch_collector_actor: epoch_collector_actor.clone(),
     });
 
     for inbox_actor in state.inbox_actors.iter() {
@@ -756,6 +846,11 @@ pub async fn init(
             .await
             .unwrap();
     }
+
+    epoch_collector_actor
+        .send(intershard::Initialize(state.clone().into_inner()))
+        .await
+        .unwrap();
 
     Box::new(move |service_config: &mut web::ServiceConfig| {
         service_config
