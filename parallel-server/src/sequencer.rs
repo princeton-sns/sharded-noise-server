@@ -54,6 +54,7 @@ pub struct SequencerActor {
     num_shards: u8,
     shard_addresses: Vec<(bool, String)>,
     phase: Phase,
+    client: reqwest::Client,
 }
 
 impl SequencerActor {
@@ -62,6 +63,7 @@ impl SequencerActor {
             num_shards,
             shard_addresses: vec![],
             phase: Phase::Registration,
+	    client: reqwest::Client::new(),
         }
     }
 }
@@ -97,9 +99,9 @@ impl Handler<ProbeShards> for SequencerActor {
     fn handle(&mut self, _msg: ProbeShards, ctx: &mut Context<Self>) -> Self::Result {
         let adds = self.shard_addresses.clone();
         let this = ctx.address().clone();
+	let httpc = self.client.clone();
 
         Box::pin(async move {
-            let httpc = reqwest::Client::new();
             for (_, addr) in adds.iter() {
                 if let Err(_) = httpc.get(addr).send().await {
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -135,9 +137,9 @@ impl Handler<EpochStart> for SequencerActor {
             .for_each(|(finished, _)| *finished = false);
 
         let adds = self.shard_addresses.clone();
+	let httpc = self.client.clone();
 
         Box::pin(async move {
-            let httpc = reqwest::Client::new();
             for (_, addr) in adds {
                 // TODO: parallelize
                 println!("Requesting epoch start");
