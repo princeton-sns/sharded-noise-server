@@ -19,13 +19,20 @@ plan:
     request:
       method: POST
       headers:
-        Authorization: "Bearer B"
+        Authorization: "Bearer b"
       body:  '[{"deviceId": "a", "payload": { "cType": 0, "ciphertext": "whos there"}}]'
       url: /message
 
-  - name: Get message
+  - name: Get message A
     request:
-      method: GET
+      method: DELETE
       headers:
         Authorization: "Bearer a"
-      url: /message
+      url: /outbox
+
+  - name: Get message B
+    request:
+      method: DELETE
+      headers:
+        Authorization: "Bearer b"
+      url: /outbox
