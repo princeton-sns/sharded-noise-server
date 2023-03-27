@@ -719,6 +719,7 @@ dependencies = [
  "actix-web",
  "blist",
  "serde",
+ "tokio",
 ]
 
 [[package]]

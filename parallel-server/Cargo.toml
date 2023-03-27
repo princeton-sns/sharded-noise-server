@@ -10,3 +10,4 @@ actix = "0.13.0"
 actix-web = "4.3.1"
 blist = "0.0.4"
 serde = { version = "1.0.158", features = ["derive"] }
+tokio = "1.26.0"
