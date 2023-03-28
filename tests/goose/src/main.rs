@@ -16,32 +16,36 @@ async fn main() -> Result<(), GooseError> {
     let g = GooseAttack::initialize()?;
 
     g.register_scenario(scenario!("PostTest").register_transaction(transaction!(post_message)))
+        .register_scenario(scenario!("DeleteRandomMailbox").register_transaction(transaction!(delete_mailbox_content)))
         .execute()
         .await?;
 
     Ok(())
 }
 
+fn generate_username() -> String {
+    let Some(letter) = LETTERS.choose(&mut rand::thread_rng()) else {todo!()};
+    let Some(number) = NUMBERS.choose(&mut rand::thread_rng()) else {todo!()};
+
+    letter.to_string() + &number.to_string()
+}
+
 fn generate_pair() -> (String, String) {
-    let Some(sender_letter) = LETTERS.choose(&mut rand::thread_rng()) else {todo!()};
-    let Some(sender_number) = NUMBERS.choose(&mut rand::thread_rng()) else {todo!()};
+    let sender = generate_username();
+    let mut recipient = generate_username();
 
-    // TODO: check not the same
-    let Some(rec_letter) = LETTERS.choose(&mut rand::thread_rng()) else {todo!()};
-    let Some(rec_number) = NUMBERS.choose(&mut rand::thread_rng()) else {todo!()};
+    while sender == recipient {
+        recipient = generate_username();
+    }
 
-    (
-        sender_letter.to_string() + &sender_number.to_string(),
-        rec_letter.to_string() + &rec_number.to_string(),
-    )
+    (sender, recipient)
+
 }
 
 async fn post_message(user: &mut GooseUser) -> TransactionResult {
     let (sender, recipient) = generate_pair();
 
-    // Build a custom HeaderMap to include with all requests made by this client.
     let mut headers = HeaderMap::new();
-
     let auth_name = "Bearer ".to_owned() + sender.as_str();
     headers.insert("Authorization", HeaderValue::from_str(&auth_name).unwrap());
     headers.insert(
@@ -68,6 +72,33 @@ async fn post_message(user: &mut GooseUser) -> TransactionResult {
         .method(GooseMethod::Post)
         .path("/message")
         .set_request_builder(request_builder.json(&data))
+        .build();
+
+    let _goose_metrics = user.request(goose_request).await;
+
+    Ok(())
+}
+
+async fn delete_mailbox_content(user: &mut GooseUser) -> TransactionResult {
+    let username = generate_username();
+
+    // keeping same structure as above altho not necessary since there's no payload
+    let mut headers = HeaderMap::new();
+    let auth_name = "Bearer ".to_owned() + username.as_str();
+    headers.insert("Authorization", HeaderValue::from_str(&auth_name).unwrap());
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_str("application/json").unwrap(),
+    );
+
+    let request_builder = user
+        .get_request_builder(&GooseMethod::Delete, "/outbox")?
+        .headers(headers);
+
+    let goose_request = GooseRequest::builder()
+        .method(GooseMethod::Delete)
+        .path("/outbox")
+        .set_request_builder(request_builder)
         .build();
 
     let _goose_metrics = user.request(goose_request).await;
