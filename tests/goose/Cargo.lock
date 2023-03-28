@@ -534,6 +534,7 @@ name = "goose-tests"
 version = "0.1.0"
 dependencies = [
  "goose",
+ "rand",
  "random-string",
  "reqwest",
  "serde",

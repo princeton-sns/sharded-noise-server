@@ -1,65 +1,69 @@
 use goose::prelude::*;
-use serde_json::json;
-use serde::{Serialize, Deserialize};
-use reqwest::header::{HeaderMap,HeaderValue};
-use random_string::generate;
 use rand::seq::SliceRandom;
 
-static Users : u8 = 1000;
-static UserIds : Vec<String> = vec![None,  Users];
+use reqwest::header::{HeaderMap, HeaderValue};
 
-fn generate_pair() -> (char, char) {
+use serde_json::json;
 
-    let senderId = UserIds.choose(&mut rand::thread_rng());
-    let recId = '0';
-    while senderId != recId {
-        recId = UserIds.choose(&mut rand::thread_rng());
-    }
-
-    (senderId, recId)
-}
+static LETTERS: [&str; 26] = [
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s",
+    "t", "u", "v", "w", "x", "y", "z",
+];
+static NUMBERS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
 
 #[tokio::main]
 async fn main() -> Result<(), GooseError> {
-
-    let charset = "1234567890abcdefghijklmnopqrstuvwxyz";
-    for i in 0..Users {
-        UserIds[i as usize ] = generate(2, charset);
-    }
-
     let g = GooseAttack::initialize()?;
 
-    g.register_scenario(scenario!("PostTest").register_transaction(transaction!(post_message))).execute().await?;
+    g.register_scenario(scenario!("PostTest").register_transaction(transaction!(post_message)))
+        .execute()
+        .await?;
 
     Ok(())
 }
 
-async fn post_message(user: &mut GooseUser) -> TransactionResult {
+fn generate_pair() -> (String, String) {
+    let Some(sender_letter) = LETTERS.choose(&mut rand::thread_rng()) else {todo!()};
+    let Some(sender_number) = NUMBERS.choose(&mut rand::thread_rng()) else {todo!()};
 
+    // TODO: check not the same
+    let Some(rec_letter) = LETTERS.choose(&mut rand::thread_rng()) else {todo!()};
+    let Some(rec_number) = NUMBERS.choose(&mut rand::thread_rng()) else {todo!()};
+
+    (
+        sender_letter.to_string() + &sender_number.to_string(),
+        rec_letter.to_string() + &rec_number.to_string(),
+    )
+}
+
+async fn post_message(user: &mut GooseUser) -> TransactionResult {
     let (sender, recipient) = generate_pair();
 
     // Build a custom HeaderMap to include with all requests made by this client.
     let mut headers = HeaderMap::new();
-    headers.insert(
-        "Authorization",
-        HeaderValue::from_str("Bearer ".concat(sender)).unwrap(),
-    );
-    headers.insert("Content-Type", HeaderValue::from_str("application/json").unwrap());
 
-    let request_builder = user.get_request_builder(&GooseMethod::Post, "/message")?
+    let auth_name = "Bearer ".to_owned() + sender.as_str();
+    headers.insert("Authorization", HeaderValue::from_str(&auth_name).unwrap());
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_str("application/json").unwrap(),
+    );
+
+    let request_builder = user
+        .get_request_builder(&GooseMethod::Post, "/message")?
         .headers(headers);
 
     let data = json!(
-        {
-            "batch": 
-            [
-            {"deviceId": sender,
-            "payload": {"cType":0, "ciphertext": "hello"}},
-            { "deviceId": recipient,
-            "payload": {"cType":0, "ciphertext": "goodbye"}},
-            ]
-        });
-    
+    {
+        "batch":
+        [
+        {"deviceId": sender,
+        "payload": {"cType":0, "ciphertext": "hello"}},
+        { "deviceId": recipient,
+        "payload": {"cType":0, "ciphertext": "goodbye"}},
+        ]
+    });
+
     let goose_request = GooseRequest::builder()
         .method(GooseMethod::Post)
         .path("/message")
