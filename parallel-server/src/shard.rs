@@ -112,6 +112,11 @@ pub mod inbox {
 
                 for message in ev.bundle.batch.into_iter() {
                     let bucket = hash_into_bucket(&message.device_id, intershard.len(), true);
+                    println!(
+                        "Delivering message into bucket {} of {}",
+                        bucket,
+                        intershard.len()
+                    );
 
                     let seq = (
                         epoch_id,
@@ -204,6 +209,7 @@ pub mod inbox {
             // the subsequent epoch and move the current queue
             // contents to the router.
             if let Some(ref cur_epoch) = self.epoch {
+                // println!("cur_epoch: {}", cur_epoch);
                 assert!(*cur_epoch + 1 == next_epoch);
 
                 // Swap out the queue and send it to the router:
@@ -422,6 +428,7 @@ pub mod intershard {
                 self.epoch = None;
 
                 Box::pin(async move {
+                    // println!("Finishing epoch {}", epoch);
                     httpc
                         .post(format!("{}/end-epoch", seq_url))
                         .json(&crate::sequencer::EndEpochReq {
@@ -663,7 +670,14 @@ fn hash_into_bucket(device_id: &str, bucket_count: usize, upper_bits: bool) -> u
         u32::from_be_bytes([a, b, c, d])
     };
 
-    (hash % (bucket_count as u32)) as usize
+    let res = (hash % (bucket_count as u32)) as usize;
+
+    println!(
+        "Hash into bucket: {}, {}, {:?} -> {} -> {}",
+        device_id, bucket_count, upper_bits, hash, res
+    );
+
+    res
 }
 
 #[get("/")]
@@ -714,6 +728,7 @@ async fn retrieve_messages(
 
 #[post("/epoch/{epoch_id}")]
 async fn start_epoch(state: web::Data<ShardState>, epoch_id: web::Path<u64>) -> impl Responder {
+    // println!("Received start_epoch request: {}", *epoch_id);
     for inbox in state.inbox_actors.iter() {
         inbox.do_send(inbox::EpochStart(*epoch_id));
     }
@@ -779,24 +794,27 @@ pub async fn init(
 
     // Now, wait until all shards have been registered at the sequencer and get
     // their IDs:
-    let mut shard_map_opt: Option<crate::sequencer::SequencerShardMapResp> = None;
+    let mut shard_map_opt: Option<crate::sequencer::SequencerShardMap> = None;
     println!("Trying to retrieve shard map, this will loop until the expected number of shards have registered...");
     while shard_map_opt.is_none() {
         let resp = httpc
-            .get(format!("{}/shardmap", &sequencer_base_url))
+            .get(format!("{}/shard-map", &sequencer_base_url))
             .send()
             .await;
 
-        if let Ok(res) = resp {
-            shard_map_opt = Some(
-                res.json::<crate::sequencer::SequencerShardMapResp>()
-                    .await
-                    .unwrap(),
-            );
-        } else {
-            print!(".");
-            io::stdout().flush().unwrap();
-            sleep(Duration::from_millis(500)).await;
+        match resp {
+            Ok(res) if res.status().is_success() => {
+                shard_map_opt = Some(
+                    res.json::<crate::sequencer::SequencerShardMap>()
+                        .await
+                        .unwrap(),
+                );
+            }
+            _ => {
+                print!(".");
+                io::stdout().flush().unwrap();
+                sleep(Duration::from_millis(500)).await;
+            }
         }
     }
     println!("Retrieved shard map!");
