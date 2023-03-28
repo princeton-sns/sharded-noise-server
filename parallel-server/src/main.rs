@@ -177,7 +177,7 @@ pub mod inbox {
         pub messages: LinkedList<crate::protocol::OutboxMessage>,
     }
 
-    struct RouterActor {
+    pub struct RouterActor {
         id: u16,
     }
 
@@ -247,9 +247,7 @@ pub mod inbox {
     }
 
     impl InboxActor {
-        pub fn new(id: u16) -> Self {
-            let router = RouterActor::new(id).start();
-
+        pub fn new(id: u16, router: Addr<RouterActor>) -> Self {
             InboxActor {
                 _id: id,
                 queue: LinkedList::new(),
@@ -550,8 +548,8 @@ pub mod sequencer {
     }
 }
 
-const INBOX_ACTORS: u16 = 32;
-const OUTBOX_ACTORS: u16 = 32;
+const INBOX_ACTORS: u16 = 12;
+const OUTBOX_ACTORS: u16 = 12;
 
 pub struct AppState {
     inbox_actors: Vec<Addr<inbox::InboxActor>>,
@@ -561,24 +559,71 @@ pub struct AppState {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    use actix::{Actor, Addr};
+    use tokio::sync::mpsc;
+    use actix::{Actor, Addr, Arbiter};
+
+    let mut arbiters = Vec::new();
 
     let sequencer = sequencer::SequencerActor::new().start();
 
-    // Boot up a set of inbox actors:
-    let inbox_actors: Vec<Addr<inbox::InboxActor>> = (0..INBOX_ACTORS)
-        .map(|id| inbox::InboxActor::new(id).start())
-        .collect();
+    // Boot up a set of inbox actors on individual arbiters:
+    let mut inbox_actors: Vec<Addr<inbox::InboxActor>> = Vec::new();
+    for id in 0..INBOX_ACTORS {
+	let (router_tx, mut router_rx) = mpsc::channel(1);
+	let router_arbiter = Arbiter::new();
+	assert!(router_arbiter.spawn(async move {
+	    let addr = inbox::RouterActor::new(id).start();
+	    router_tx.send(addr).await;
+	}));
+	arbiters.push(router_arbiter);
+	let router = router_rx.recv().await.unwrap();
 
-    // Boot up a set of outbox actors:
-    let outbox_actors: Vec<(Addr<outbox::ReceiverActor>, Addr<outbox::OutboxActor>)> = (0
-        ..OUTBOX_ACTORS)
-        .map(|id| {
-            let out_id = outbox::OutboxActor::new(id, sequencer.clone()).start();
-            let rec_id = outbox::ReceiverActor::new(id, out_id.clone()).start();
-            (rec_id, out_id)
-        })
-        .collect();
+	let (inbox_tx, mut inbox_rx) = mpsc::channel(1);
+	let inbox_arbiter = Arbiter::new();
+	assert!(inbox_arbiter.spawn(async move {
+	    let addr = inbox::InboxActor::new(id, router).start();
+	    inbox_tx.send(addr).await;
+	}));
+	arbiters.push(inbox_arbiter);
+
+	inbox_actors.push(inbox_rx.recv().await.unwrap());
+    }
+
+    // Boot up a set of outbox actors on individual arbiters:
+    let mut outbox_actors: Vec<(Addr<outbox::ReceiverActor>, Addr<outbox::OutboxActor>)> = Vec::new();
+    for id in 0..OUTBOX_ACTORS {
+	let (outbox_tx, mut outbox_rx) = mpsc::channel(1);
+	let outbox_arbiter = Arbiter::new();
+	let sequencer_clone = sequencer.clone();
+	assert!(outbox_arbiter.spawn(async move {
+	    let addr = outbox::OutboxActor::new(id, sequencer_clone).start();
+	    outbox_tx.send(addr).await;
+	}));
+	arbiters.push(outbox_arbiter);
+	let outbox_addr = outbox_rx.recv().await.unwrap();
+
+	let (recv_tx, mut recv_rx) = mpsc::channel(1);
+	let recv_arbiter = Arbiter::new();
+	let outbox_addr_clone = outbox_addr.clone();
+	assert!(recv_arbiter.spawn(async move {
+	    let addr = outbox::ReceiverActor::new(id, outbox_addr_clone).start();
+	    recv_tx.send(addr).await;
+	}));
+	arbiters.push(recv_arbiter);
+
+	outbox_actors.push((recv_rx.recv().await.unwrap(), outbox_addr));
+    }
+
+
+    // // Boot up a set of outbox actors:
+    // let outbox_actors: Vec<(Addr<outbox::ReceiverActor>, Addr<outbox::OutboxActor>)> = (0
+    //     ..OUTBOX_ACTORS)
+    //     .map(|id| {
+    //         let out_id = outbox::OutboxActor::new(id, sequencer.clone()).start();
+    //         let rec_id = outbox::ReceiverActor::new(id, out_id.clone()).start();
+    //         (rec_id, out_id)
+    //     })
+    //     .collect();
 
     let state = web::Data::new(AppState {
         _sequencer: sequencer.clone(),
@@ -619,3 +664,4 @@ async fn main() -> std::io::Result<()> {
     .run()
     .await
 }
+
