@@ -155,9 +155,7 @@ pub mod inbox {
     }
 
     impl InboxActor {
-        pub fn new(id: u8) -> Self {
-            let router = RouterActor::new(id).start();
-
+        pub fn new(id: u8, router: Addr<RouterActor>) -> Self {
             InboxActor {
                 _id: id,
                 queue: LinkedList::new(),
@@ -748,9 +746,12 @@ pub async fn init(
     inbox_count: u8,
     outbox_count: u8,
 ) -> impl Fn(&mut web::ServiceConfig) + Clone + Send + 'static {
+    use actix::{Actor, Addr, Arbiter};
     use std::io::{self, Write};
+    use tokio::sync::mpsc;
 
     let httpc = reqwest::Client::new();
+    let mut arbiters = Vec::new();
 
     // Register ourselves with the sequencer to be assigned a shard id
     println!(
@@ -801,29 +802,62 @@ pub async fn init(
     println!("Retrieved shard map!");
     let shard_map = shard_map_opt.unwrap().shards;
 
-    // Boot up a set of inbox actors:
-    let inbox_actors: Vec<Addr<inbox::InboxActor>> = (0..inbox_count)
-        .map(|id| inbox::InboxActor::new(id).start())
-        .collect();
+    let mut inbox_actors: Vec<Addr<inbox::InboxActor>> = Vec::new();
+    for id in 0..inbox_count {
+        let (router_tx, mut router_rx) = mpsc::channel(1);
+        let router_arbiter = Arbiter::new();
+        assert!(router_arbiter.spawn(async move {
+            let addr = inbox::RouterActor::new(id).start();
+            router_tx.send(addr).await;
+        }));
+        arbiters.push(router_arbiter);
+        let router = router_rx.recv().await.unwrap();
 
-    // Boot up a set of intershard routers:
-    let intershard_router_actors: Vec<Addr<intershard::InterShardRouterActor>> = (0..shard_map
-        .len())
-        .map(|id| intershard::InterShardRouterActor::new(register_resp.shard_id, id as u8).start())
-        .collect();
+        let (inbox_tx, mut inbox_rx) = mpsc::channel(1);
+        let inbox_arbiter = Arbiter::new();
+        assert!(inbox_arbiter.spawn(async move {
+            let addr = inbox::InboxActor::new(id, router).start();
+            inbox_tx.send(addr).await;
+        }));
+        arbiters.push(inbox_arbiter);
 
-    // Boot up a set of outbox actors:
-    let outbox_actors: Vec<(Addr<outbox::ReceiverActor>, Addr<outbox::OutboxActor>)> = (0
-        ..outbox_count)
-        .map(|id| {
-            let out_id = outbox::OutboxActor::new(id).start();
-            let rec_id = outbox::ReceiverActor::new(id, out_id.clone()).start();
-            (rec_id, out_id)
-        })
-        .collect();
+        inbox_actors.push(inbox_rx.recv().await.unwrap());
+    }
 
-    let epoch_collector_actor: Addr<intershard::EpochCollectorActor> =
-        intershard::EpochCollectorActor::new().start();
+    // Boot up a set of outbox actors on individual arbiters:
+    let mut outbox_actors: Vec<(Addr<outbox::ReceiverActor>, Addr<outbox::OutboxActor>)> =
+        Vec::new();
+    for id in 0..outbox_count {
+        let (outbox_tx, mut outbox_rx) = mpsc::channel(1);
+        let outbox_arbiter = Arbiter::new();
+        let sequencer_clone = sequencer_base_url.clone();
+        assert!(outbox_arbiter.spawn(async move {
+            let addr = outbox::OutboxActor::new(id, sequencer_clone).start();
+            outbox_tx.send(addr).await;
+        }));
+        arbiters.push(outbox_arbiter);
+        let outbox_addr = outbox_rx.recv().await.unwrap();
+
+        let (recv_tx, mut recv_rx) = mpsc::channel(1);
+        let recv_arbiter = Arbiter::new();
+        let outbox_addr_clone = outbox_addr.clone();
+        assert!(recv_arbiter.spawn(async move {
+            let addr = outbox::ReceiverActor::new(id, outbox_addr_clone).start();
+            recv_tx.send(addr).await;
+        }));
+        arbiters.push(recv_arbiter);
+
+        outbox_actors.push((recv_rx.recv().await.unwrap(), outbox_addr));
+    }
+
+    let (collector_tx, mut collector_rx) = mpsc::channel(1);
+    let collector_arbiter = Arbiter::new();
+    assert!(collector_arbiter.spawn(async move {
+        let addr = intershard::EpochCollectorActor::new().start();
+        collector_tx.send(addr).await;
+    }));
+    arbiters.push(collector_arbiter);
+    let epoch_collector_actor = collector_rx.recv().await.unwrap();
 
     let state = web::Data::new(ShardState {
         httpc,
