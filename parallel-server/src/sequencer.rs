@@ -63,7 +63,7 @@ impl SequencerActor {
             num_shards,
             shard_addresses: vec![],
             phase: Phase::Registration,
-	    client: reqwest::Client::new(),
+            client: reqwest::Client::new(),
         }
     }
 }
@@ -99,7 +99,7 @@ impl Handler<ProbeShards> for SequencerActor {
     fn handle(&mut self, _msg: ProbeShards, ctx: &mut Context<Self>) -> Self::Result {
         let adds = self.shard_addresses.clone();
         let this = ctx.address().clone();
-	let httpc = self.client.clone();
+        let httpc = self.client.clone();
 
         Box::pin(async move {
             for (_, addr) in adds.iter() {
@@ -137,7 +137,7 @@ impl Handler<EpochStart> for SequencerActor {
             .for_each(|(finished, _)| *finished = false);
 
         let adds = self.shard_addresses.clone();
-	let httpc = self.client.clone();
+        let httpc = self.client.clone();
 
         Box::pin(async move {
             for (_, addr) in adds {

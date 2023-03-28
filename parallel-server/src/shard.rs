@@ -80,7 +80,7 @@ pub mod inbox {
         pub messages: LinkedList<super::client_protocol::OutboxMessage>,
     }
 
-    struct RouterActor {
+    pub struct RouterActor {
         id: u8,
     }
 
@@ -820,6 +820,7 @@ pub async fn init(
     println!("Retrieved shard map!");
     let shard_map = shard_map_opt.unwrap().shards;
 
+    // Boot up a set of inbox actors on individual arbiters
     let mut inbox_actors: Vec<Addr<inbox::InboxActor>> = Vec::new();
     for id in 0..inbox_count {
         let (router_tx, mut router_rx) = mpsc::channel(1);
@@ -842,6 +843,20 @@ pub async fn init(
         inbox_actors.push(inbox_rx.recv().await.unwrap());
     }
 
+    // Boot up a set of intershard routers:
+    let mut intershard_router_actors: Vec<Addr<intershard::InterShardRouterActor>> = Vec::new();
+    for id in 0..shard_map.len() {
+        let (isr_tx, mut isr_rx) = mpsc::channel(1);
+        let isr_arbiter = Arbiter::new();
+        assert!(isr_arbiter.spawn(async move {
+            let addr =
+                intershard::InterShardRouterActor::new(register_resp.shard_id, id as u8).start();
+            isr_tx.send(addr).await;
+        }));
+        arbiters.push(isr_arbiter);
+        intershard_router_actors.push(isr_rx.recv().await.unwrap());
+    }
+
     // Boot up a set of outbox actors on individual arbiters:
     let mut outbox_actors: Vec<(Addr<outbox::ReceiverActor>, Addr<outbox::OutboxActor>)> =
         Vec::new();
@@ -850,7 +865,7 @@ pub async fn init(
         let outbox_arbiter = Arbiter::new();
         let sequencer_clone = sequencer_base_url.clone();
         assert!(outbox_arbiter.spawn(async move {
-            let addr = outbox::OutboxActor::new(id, sequencer_clone).start();
+            let addr = outbox::OutboxActor::new(id).start();
             outbox_tx.send(addr).await;
         }));
         arbiters.push(outbox_arbiter);
