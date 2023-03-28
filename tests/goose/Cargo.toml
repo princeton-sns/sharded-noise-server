@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 goose = "^0.17"
+random-string = "1.0.0"
 reqwest = "0.11.16"
 serde = "1.0.159"
 serde_json = "1.0.95"
