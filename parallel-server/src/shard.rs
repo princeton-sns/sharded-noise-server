@@ -1,8 +1,9 @@
 use actix::{Actor, Addr};
 use actix_web::{
-    delete, error, get, http::header, post, web, HttpMessage, HttpResponse, Responder,
+    delete, error, get, http::header, post, web, App, HttpMessage, HttpResponse, HttpServer,
+    Responder,
 };
-
+use std::io;
 use tokio::time::{sleep, Duration};
 
 pub mod client_protocol {
@@ -28,7 +29,7 @@ pub mod client_protocol {
         pub batch: Vec<Message>,
     }
 
-    #[derive(Debug, Serialize, Deserialize, Clone)]
+    #[derive(Debug, Serialize, Clone)]
     #[serde(rename_all = "camelCase")]
     pub struct OutboxMessage {
         pub sender: String,
@@ -80,7 +81,7 @@ pub mod inbox {
         pub messages: LinkedList<super::client_protocol::OutboxMessage>,
     }
 
-    pub struct RouterActor {
+    struct RouterActor {
         id: u8,
     }
 
@@ -100,7 +101,7 @@ pub mod inbox {
         fn handle(&mut self, msg: InboxEpoch, _ctx: &mut Context<Self>) {
             let InboxEpoch(state, epoch_id, shard_id, queue) = msg;
 
-            let mut intershard = vec![LinkedList::new(); state.intershard_router_actors.len()];
+            let mut outboxes = vec![LinkedList::new(); state.outbox_actors.len()];
 
             for (idx, ev) in queue.into_iter().enumerate() {
                 let receivers: Vec<_> = ev
@@ -111,12 +112,7 @@ pub mod inbox {
                     .collect();
 
                 for message in ev.bundle.batch.into_iter() {
-                    let bucket = hash_into_bucket(&message.device_id, intershard.len(), true);
-                    println!(
-                        "Delivering message into bucket {} of {}",
-                        bucket,
-                        intershard.len()
-                    );
+                    let bucket = hash_into_bucket(&message.device_id, outboxes.len());
 
                     let seq = (
                         epoch_id,
@@ -132,21 +128,18 @@ pub mod inbox {
                         seq,
                     };
 
-                    intershard[bucket].push_back(rt_msg);
+                    outboxes[bucket].push_back(rt_msg);
                 }
             }
 
-            for (messages, intershard_rt) in intershard
-                .into_iter()
-                .zip(state.intershard_router_actors.iter())
-            {
+            for (messages, outbox) in outboxes.into_iter().zip(state.outbox_actors.iter()) {
                 let routed_batch = RoutedEpochBatch {
                     epoch_id,
                     inbox_id: self.id,
                     messages,
                 };
 
-                intershard_rt.do_send(routed_batch);
+                outbox.0.do_send(routed_batch);
             }
         }
     }
@@ -160,7 +153,9 @@ pub mod inbox {
     }
 
     impl InboxActor {
-        pub fn new(id: u8, router: Addr<RouterActor>) -> Self {
+        pub fn new(id: u8) -> Self {
+            let router = RouterActor::new(id).start();
+
             InboxActor {
                 _id: id,
                 queue: LinkedList::new(),
@@ -209,7 +204,6 @@ pub mod inbox {
             // the subsequent epoch and move the current queue
             // contents to the router.
             if let Some(ref cur_epoch) = self.epoch {
-                // println!("cur_epoch: {}", cur_epoch);
                 assert!(*cur_epoch + 1 == next_epoch);
 
                 // Swap out the queue and send it to the router:
@@ -227,234 +221,12 @@ pub mod inbox {
     }
 }
 
-pub mod intershard {
-    use actix::{Actor, Context, Handler, Message, ResponseFuture};
-    use serde::{Deserialize, Serialize};
-    use std::collections::LinkedList;
-
-    use std::sync::Arc;
-
-    #[derive(Message, Serialize, Deserialize, Clone, Debug)]
-    #[rtype(result = "()")]
-    pub struct RoutedEpochBatch {
-        pub src_shard_id: u8,
-        pub dst_shard_id: u8,
-        pub epoch_id: u64,
-        pub messages: LinkedList<super::client_protocol::OutboxMessage>,
-    }
-
-    #[derive(Message, Clone)]
-    #[rtype(result = "()")]
-    pub struct Initialize(pub Arc<super::ShardState>);
-
-    pub struct InterShardRouterActor {
-        src_shard_id: u8,
-        dst_shard_id: u8,
-        state: Option<Arc<super::ShardState>>,
-        input_queues: (usize, Vec<Option<super::inbox::RoutedEpochBatch>>),
-    }
-
-    impl InterShardRouterActor {
-        pub fn new(src_shard_id: u8, dst_shard_id: u8) -> Self {
-            InterShardRouterActor {
-                src_shard_id,
-                dst_shard_id,
-                state: None,
-                input_queues: (0, vec![]),
-            }
-        }
-    }
-
-    impl Actor for InterShardRouterActor {
-        type Context = Context<Self>;
-    }
-
-    impl Handler<Initialize> for InterShardRouterActor {
-        type Result = ();
-
-        fn handle(&mut self, msg: Initialize, _ctx: &mut Context<Self>) -> Self::Result {
-            let Initialize(state) = msg;
-            self.input_queues = (0, vec![None; state.inbox_actors.len()]);
-            self.state = Some(state);
-        }
-    }
-
-    impl Handler<super::inbox::RoutedEpochBatch> for InterShardRouterActor {
-        type Result = ResponseFuture<()>;
-
-        fn handle(
-            &mut self,
-            msg: super::inbox::RoutedEpochBatch,
-            _ctx: &mut Context<Self>,
-        ) -> Self::Result {
-            let inbox_id = msg.inbox_id as usize;
-            let epoch_id = msg.epoch_id as u64;
-            assert!(self.input_queues.1[inbox_id].is_none());
-            self.input_queues.1[inbox_id] = Some(msg);
-            self.input_queues.0 += 1;
-
-            // check if every element of input_queus has been written to
-            if self.input_queues.0 == self.input_queues.1.len() {
-                let mut shard_batch = LinkedList::new();
-
-                for queue in self.input_queues.1.iter_mut() {
-                    shard_batch.append(&mut queue.as_mut().unwrap().messages);
-                }
-
-                self.input_queues = (
-                    0,
-                    vec![None; self.state.as_ref().unwrap().inbox_actors.len()],
-                );
-
-                if self.src_shard_id == self.dst_shard_id {
-                    distribute_intershard_batch(
-                        self.state.as_ref().unwrap(),
-                        RoutedEpochBatch {
-                            src_shard_id: self.src_shard_id,
-                            dst_shard_id: self.dst_shard_id,
-                            epoch_id: epoch_id,
-                            messages: shard_batch,
-                        },
-                    );
-                    Box::pin(async move {})
-                } else {
-                    let dst_shard_url =
-                        self.state.as_ref().unwrap().shard_map[self.dst_shard_id as usize].clone();
-                    let (src_shard_id, dst_shard_id) = (self.src_shard_id, self.dst_shard_id);
-                    let httpc = self.state.as_ref().unwrap().httpc.clone();
-
-                    Box::pin(async move {
-                        httpc
-                            .post(format!("{}/intershard-batch", dst_shard_url))
-                            .json(&RoutedEpochBatch {
-                                src_shard_id: src_shard_id,
-                                dst_shard_id: dst_shard_id,
-                                epoch_id: epoch_id,
-                                messages: shard_batch,
-                            })
-                            .send()
-                            .await
-                            .unwrap();
-                    })
-                }
-            } else {
-                Box::pin(async move {})
-            }
-        }
-    }
-
-    pub fn distribute_intershard_batch(state: &super::ShardState, batch: RoutedEpochBatch) {
-        assert!(batch.dst_shard_id == state.shard_id);
-
-        let mut outboxes = vec![LinkedList::new(); state.outbox_actors.len()];
-
-        for message in batch.messages.into_iter() {
-            let bucket = super::hash_into_bucket(&message.payload.device_id, outboxes.len(), false);
-            outboxes[bucket].push_back(message);
-        }
-
-        for (messages, outbox) in outboxes.into_iter().zip(state.outbox_actors.iter()) {
-            let routed_batch = RoutedEpochBatch {
-                epoch_id: batch.epoch_id,
-                src_shard_id: batch.src_shard_id,
-                dst_shard_id: state.shard_id,
-                messages,
-            };
-
-            outbox.0.do_send(routed_batch);
-        }
-    }
-
-    pub struct EpochCollectorActor {
-        state: Option<Arc<super::ShardState>>,
-        epoch: Option<u64>,
-        input_queues: (usize, Vec<bool>),
-    }
-
-    impl EpochCollectorActor {
-        pub fn new() -> Self {
-            EpochCollectorActor {
-                state: None,
-                epoch: None,
-                input_queues: (0, vec![]),
-            }
-        }
-    }
-
-    impl Actor for EpochCollectorActor {
-        type Context = Context<Self>;
-    }
-
-    impl Handler<Initialize> for EpochCollectorActor {
-        type Result = ();
-
-        fn handle(&mut self, msg: Initialize, _ctx: &mut Context<Self>) -> Self::Result {
-            let Initialize(state) = msg;
-            self.input_queues = (0, vec![false; state.outbox_actors.len()]);
-            self.state = Some(state);
-        }
-    }
-
-    impl Handler<super::outbox::EndEpoch> for EpochCollectorActor {
-        type Result = ResponseFuture<()>;
-
-        fn handle(
-            &mut self,
-            msg: super::outbox::EndEpoch,
-            _ctx: &mut Context<Self>,
-        ) -> Self::Result {
-            let outbox_id = msg.1;
-            let epoch = msg.0;
-
-            assert!(!self.input_queues.1[outbox_id as usize]);
-            self.input_queues.1[outbox_id as usize] = true;
-            self.input_queues.0 += 1;
-
-            if let Some(cur_epoch) = self.epoch {
-                assert!(cur_epoch == epoch);
-            }
-            self.epoch = Some(epoch);
-
-            // check if every element of input_queus has been written to
-            if self.input_queues.0 == self.input_queues.1.len() {
-                let seq_url = self.state.as_ref().unwrap().sequencer_url.clone();
-                let self_shard_id = self.state.as_ref().unwrap().shard_id;
-                let httpc = self.state.as_ref().unwrap().httpc.clone();
-
-                self.input_queues = (
-                    0,
-                    vec![false; self.state.as_ref().unwrap().outbox_actors.len()],
-                );
-                self.epoch = None;
-
-                Box::pin(async move {
-                    // println!("Finishing epoch {}", epoch);
-                    httpc
-                        .post(format!("{}/end-epoch", seq_url))
-                        .json(&crate::sequencer::EndEpochReq {
-                            shard_id: self_shard_id,
-                            epoch_id: epoch,
-                        })
-                        .send()
-                        .await
-                        .unwrap();
-                })
-            } else {
-                Box::pin(async move {})
-            }
-        }
-    }
-}
-
 pub mod outbox {
+    use super::inbox::RoutedEpochBatch;
     use actix::{Actor, Addr, Context, Handler, Message, MessageResponse};
     use std::collections::{HashMap, LinkedList};
     use std::mem;
     use std::sync::Arc;
-
-    #[derive(Message, Clone)]
-    #[rtype(result = "()")]
-    pub struct EndEpoch(pub u64, pub u8);
 
     #[derive(Message, Clone)]
     #[rtype(result = "()")]
@@ -464,7 +236,7 @@ pub mod outbox {
         _id: u8,
         outbox_address: Addr<OutboxActor>,
         state: Option<Arc<super::ShardState>>,
-        input_queues: (usize, Vec<Option<super::intershard::RoutedEpochBatch>>),
+        input_queues: Vec<Option<RoutedEpochBatch>>,
     }
 
     impl ReceiverActor {
@@ -473,7 +245,7 @@ pub mod outbox {
                 _id: id,
                 outbox_address,
                 state: None,
-                input_queues: (0, Vec::new()),
+                input_queues: Vec::new(),
             }
         }
     }
@@ -486,33 +258,30 @@ pub mod outbox {
         type Result = ();
 
         fn handle(&mut self, msg: Initialize, _ctx: &mut Context<Self>) -> Self::Result {
-            self.input_queues = (0, vec![None; msg.0.shard_map.len()]);
+            self.input_queues = vec![None; msg.0.inbox_actors.len()];
             self.state = Some(msg.0);
         }
     }
 
-    impl Handler<super::intershard::RoutedEpochBatch> for ReceiverActor {
+    impl Handler<super::inbox::RoutedEpochBatch> for ReceiverActor {
         type Result = ();
 
         fn handle(
             &mut self,
-            msg: super::intershard::RoutedEpochBatch,
+            msg: super::inbox::RoutedEpochBatch,
             _ctx: &mut Context<Self>,
         ) -> Self::Result {
-            let shard_id = msg.src_shard_id as usize;
+            let inbox_id = msg.inbox_id as usize;
             let epoch_id = msg.epoch_id as u64;
-            assert!(self.input_queues.1[shard_id].is_none());
-            self.input_queues.1[shard_id] = Some(msg);
-            self.input_queues.0 += 1;
+            self.input_queues[inbox_id] = Some(msg);
 
             // check if every element of input_queus has been written to
-            if self.input_queues.0 == self.input_queues.1.len() {
+            if self.input_queues.iter().find(|v| v.is_none()).is_none() {
                 let mut output_map = HashMap::new();
                 for b in mem::replace(
                     &mut self.input_queues,
-                    (0, vec![None; self.state.as_ref().unwrap().shard_map.len()]),
+                    vec![None; self.state.as_ref().unwrap().inbox_actors.len()],
                 )
-                .1
                 .into_iter()
                 {
                     let batch = b.unwrap();
@@ -536,7 +305,6 @@ pub mod outbox {
         // been exposed to the client, and all messages from including
         // this message)
         client_mailboxes: HashMap<String, (u64, LinkedList<super::client_protocol::OutboxMessage>)>,
-        state: Option<Arc<super::ShardState>>,
     }
 
     impl OutboxActor {
@@ -545,7 +313,6 @@ pub mod outbox {
                 id,
                 next_epoch: 0,
                 client_mailboxes: HashMap::new(),
-                state: None,
             }
         }
     }
@@ -568,14 +335,6 @@ pub mod outbox {
     #[rtype(result = "DeviceMessages")]
     pub struct GetDeviceMessages(pub String);
 
-    impl Handler<Initialize> for OutboxActor {
-        type Result = ();
-
-        fn handle(&mut self, msg: Initialize, _ctx: &mut Context<Self>) -> Self::Result {
-            self.state = Some(msg.0);
-        }
-    }
-
     impl Handler<DeviceEpochBatch> for OutboxActor {
         type Result = ();
 
@@ -596,11 +355,9 @@ pub mod outbox {
 
             self.next_epoch = epoch_id + 1;
 
-            self.state
-                .as_ref()
-                .unwrap()
-                .epoch_collector_actor
-                .do_send(super::outbox::EndEpoch(epoch_id, self.id));
+            unimplemented!()
+            // self.sequencer
+            //     .do_send(crate::sequencer::EndEpoch(epoch_id, self.id));
         }
     }
 
@@ -656,28 +413,13 @@ impl header::Header for BearerToken {
     }
 }
 
-fn hash_into_bucket(device_id: &str, bucket_count: usize, upper_bits: bool) -> usize {
+fn hash_into_bucket(device_id: &str, bucket_count: usize) -> usize {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
     device_id.hash(&mut hasher);
-    let hash = if upper_bits {
-        let [a, b, c, d, _, _, _, _] = u64::to_be_bytes(hasher.finish());
-        u32::from_be_bytes([a, b, c, d])
-    } else {
-        let [_, _, _, _, a, b, c, d] = u64::to_be_bytes(hasher.finish());
-        u32::from_be_bytes([a, b, c, d])
-    };
-
-    let res = (hash % (bucket_count as u32)) as usize;
-
-    println!(
-        "Hash into bucket: {}, {}, {:?} -> {} -> {}",
-        device_id, bucket_count, upper_bits, hash, res
-    );
-
-    res
+    (hasher.finish() % (bucket_count as u64)) as usize
 }
 
 #[get("/")]
@@ -693,7 +435,7 @@ async fn handle_message(
 ) -> impl Responder {
     let sender_id = auth.into_inner().into_token();
     let inbox_actors_cnt = state.inbox_actors.len();
-    let actor_idx = hash_into_bucket(&sender_id, inbox_actors_cnt, false);
+    let actor_idx = hash_into_bucket(&sender_id, inbox_actors_cnt);
 
     // Now, send the message to the corresponding actor:
     let epoch = state.inbox_actors[actor_idx]
@@ -715,7 +457,7 @@ async fn retrieve_messages(
 ) -> impl Responder {
     let device_id = auth.into_inner().into_token();
     let outbox_actors_cnt = state.outbox_actors.len();
-    let actor_idx = hash_into_bucket(&device_id, outbox_actors_cnt, false);
+    let actor_idx = hash_into_bucket(&device_id, outbox_actors_cnt);
 
     let messages = state.outbox_actors[actor_idx]
         .1
@@ -726,33 +468,11 @@ async fn retrieve_messages(
     web::Json(messages.0)
 }
 
-#[post("/epoch/{epoch_id}")]
-async fn start_epoch(state: web::Data<ShardState>, epoch_id: web::Path<u64>) -> impl Responder {
-    // println!("Received start_epoch request: {}", *epoch_id);
-    for inbox in state.inbox_actors.iter() {
-        inbox.do_send(inbox::EpochStart(*epoch_id));
-    }
-    ""
-}
-
-#[post("/intershard-batch")]
-async fn intershard_batch(
-    state: web::Data<ShardState>,
-    batch: web::Json<intershard::RoutedEpochBatch>,
-) -> impl Responder {
-    intershard::distribute_intershard_batch(&*state, batch.into_inner());
-    ""
-}
-
 pub struct ShardState {
-    httpc: reqwest::Client,
     shard_id: u8,
     shard_map: Vec<String>,
-    sequencer_url: String,
     inbox_actors: Vec<Addr<inbox::InboxActor>>,
-    intershard_router_actors: Vec<Addr<intershard::InterShardRouterActor>>,
     outbox_actors: Vec<(Addr<outbox::ReceiverActor>, Addr<outbox::OutboxActor>)>,
-    epoch_collector_actor: Addr<intershard::EpochCollectorActor>,
 }
 
 pub async fn init(
@@ -761,19 +481,15 @@ pub async fn init(
     inbox_count: u8,
     outbox_count: u8,
 ) -> impl Fn(&mut web::ServiceConfig) + Clone + Send + 'static {
-    use actix::{Actor, Addr, Arbiter};
     use std::io::{self, Write};
-    use tokio::sync::mpsc;
 
     let httpc = reqwest::Client::new();
-    let mut arbiters = Vec::new();
 
     // Register ourselves with the sequencer to be assigned a shard id
     println!(
         "Registering ourselves ({}) at sequencer ({}) with {}/{} inboxes/outboxes...",
         shard_base_url, sequencer_base_url, inbox_count, outbox_count
     );
-
     let register_resp = httpc
         .post(format!("{}/register", &sequencer_base_url))
         .json(&crate::sequencer::SequencerRegisterReq {
@@ -798,121 +514,50 @@ pub async fn init(
     println!("Trying to retrieve shard map, this will loop until the expected number of shards have registered...");
     while shard_map_opt.is_none() {
         let resp = httpc
-            .get(format!("{}/shard-map", &sequencer_base_url))
+            .get(format!("{}/shardmap", &sequencer_base_url))
             .send()
             .await;
 
-        match resp {
-            Ok(res) if res.status().is_success() => {
-                shard_map_opt = Some(
-                    res.json::<crate::sequencer::SequencerShardMap>()
-                        .await
-                        .unwrap(),
-                );
-            }
-            _ => {
-                print!(".");
-                io::stdout().flush().unwrap();
-                sleep(Duration::from_millis(500)).await;
-            }
+        if let Ok(res) = resp {
+            shard_map_opt = Some(
+                res.json::<crate::sequencer::SequencerShardMap>()
+                    .await
+                    .unwrap(),
+            );
+        } else {
+            print!(".");
+            io::stdout().flush();
+            sleep(Duration::from_millis(500));
         }
     }
     println!("Retrieved shard map!");
-    let shard_map = shard_map_opt.unwrap().shards;
+    let shard_map = shard_map_opt.unwrap();
 
-    // Boot up a set of inbox actors on individual arbiters
-    let mut inbox_actors: Vec<Addr<inbox::InboxActor>> = Vec::new();
-    for id in 0..inbox_count {
-        let (router_tx, mut router_rx) = mpsc::channel(1);
-        let router_arbiter = Arbiter::new();
-        assert!(router_arbiter.spawn(async move {
-            let addr = inbox::RouterActor::new(id).start();
-            router_tx.send(addr).await;
-        }));
-        arbiters.push(router_arbiter);
-        let router = router_rx.recv().await.unwrap();
+    // Boot up a set of inbox actors:
+    let inbox_actors: Vec<Addr<inbox::InboxActor>> = (0..inbox_count)
+        .map(|id| inbox::InboxActor::new(id).start())
+        .collect();
 
-        let (inbox_tx, mut inbox_rx) = mpsc::channel(1);
-        let inbox_arbiter = Arbiter::new();
-        assert!(inbox_arbiter.spawn(async move {
-            let addr = inbox::InboxActor::new(id, router).start();
-            inbox_tx.send(addr).await;
-        }));
-        arbiters.push(inbox_arbiter);
-
-        inbox_actors.push(inbox_rx.recv().await.unwrap());
-    }
-
-    // Boot up a set of intershard routers:
-    let mut intershard_router_actors: Vec<Addr<intershard::InterShardRouterActor>> = Vec::new();
-    for id in 0..shard_map.len() {
-        let (isr_tx, mut isr_rx) = mpsc::channel(1);
-        let isr_arbiter = Arbiter::new();
-        assert!(isr_arbiter.spawn(async move {
-            let addr =
-                intershard::InterShardRouterActor::new(register_resp.shard_id, id as u8).start();
-            isr_tx.send(addr).await;
-        }));
-        arbiters.push(isr_arbiter);
-        intershard_router_actors.push(isr_rx.recv().await.unwrap());
-    }
-
-    // Boot up a set of outbox actors on individual arbiters:
-    let mut outbox_actors: Vec<(Addr<outbox::ReceiverActor>, Addr<outbox::OutboxActor>)> =
-        Vec::new();
-    for id in 0..outbox_count {
-        let (outbox_tx, mut outbox_rx) = mpsc::channel(1);
-        let outbox_arbiter = Arbiter::new();
-        let sequencer_clone = sequencer_base_url.clone();
-        assert!(outbox_arbiter.spawn(async move {
-            let addr = outbox::OutboxActor::new(id).start();
-            outbox_tx.send(addr).await;
-        }));
-        arbiters.push(outbox_arbiter);
-        let outbox_addr = outbox_rx.recv().await.unwrap();
-
-        let (recv_tx, mut recv_rx) = mpsc::channel(1);
-        let recv_arbiter = Arbiter::new();
-        let outbox_addr_clone = outbox_addr.clone();
-        assert!(recv_arbiter.spawn(async move {
-            let addr = outbox::ReceiverActor::new(id, outbox_addr_clone).start();
-            recv_tx.send(addr).await;
-        }));
-        arbiters.push(recv_arbiter);
-
-        outbox_actors.push((recv_rx.recv().await.unwrap(), outbox_addr));
-    }
-
-    let (collector_tx, mut collector_rx) = mpsc::channel(1);
-    let collector_arbiter = Arbiter::new();
-    assert!(collector_arbiter.spawn(async move {
-        let addr = intershard::EpochCollectorActor::new().start();
-        collector_tx.send(addr).await;
-    }));
-    arbiters.push(collector_arbiter);
-    let epoch_collector_actor = collector_rx.recv().await.unwrap();
+    // Boot up a set of outbox actors:
+    let outbox_actors: Vec<(Addr<outbox::ReceiverActor>, Addr<outbox::OutboxActor>)> = (0
+        ..outbox_count)
+        .map(|id| {
+            let out_id = outbox::OutboxActor::new(id).start();
+            let rec_id = outbox::ReceiverActor::new(id, out_id.clone()).start();
+            (rec_id, out_id)
+        })
+        .collect();
 
     let state = web::Data::new(ShardState {
-        httpc,
-        sequencer_url: sequencer_base_url,
         shard_id: register_resp.shard_id,
-        shard_map,
+        shard_map: shard_map.shards,
         inbox_actors,
-        intershard_router_actors,
         outbox_actors,
-        epoch_collector_actor: epoch_collector_actor.clone(),
     });
 
     for inbox_actor in state.inbox_actors.iter() {
         inbox_actor
             .send(inbox::Initialize(state.clone().into_inner()))
-            .await
-            .unwrap();
-    }
-
-    for intershard_router_actor in state.intershard_router_actors.iter() {
-        intershard_router_actor
-            .send(intershard::Initialize(state.clone().into_inner()))
             .await
             .unwrap();
     }
@@ -923,28 +568,12 @@ pub async fn init(
             .send(outbox::Initialize(state.clone().into_inner()))
             .await
             .unwrap();
-        outbox_actor
-            .1
-            .send(outbox::Initialize(state.clone().into_inner()))
-            .await
-            .unwrap();
     }
-
-    epoch_collector_actor
-        .send(intershard::Initialize(state.clone().into_inner()))
-        .await
-        .unwrap();
 
     Box::new(move |service_config: &mut web::ServiceConfig| {
         service_config
             .app_data(state.clone())
-            // Client API
             .service(handle_message)
-            .service(retrieve_messages)
-            // Sequencer API
-            .service(start_epoch)
-            .service(index)
-            // Intershard API
-            .service(intershard_batch);
+            .service(retrieve_messages);
     })
 }
