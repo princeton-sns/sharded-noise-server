@@ -542,6 +542,7 @@ pub mod sequencer {
                     for inbox in self.state.as_ref().unwrap().inbox_actors.iter() {
                         inbox.do_send(crate::inbox::EpochStart(self.epoch));
                     }
+                    println!("End epoch: {:?}", self.epoch);
                 }
             }
         }
