@@ -41,8 +41,17 @@ pub mod client_protocol {
 pub mod inbox {
     use super::hash_into_bucket;
     use actix::{Actor, Addr, Context, Handler, Message};
+    use serde::{Deserialize, Serialize};
+    use std::borrow::Cow;
     use std::collections::LinkedList;
+    use std::fs;
     use std::sync::Arc;
+
+    #[derive(Serialize, Deserialize)]
+    pub enum PersistRecord<'a> {
+        Epoch(u64),
+        Message(Cow<'a, super::client_protocol::OutboxMessage>),
+    }
 
     #[derive(Message, Clone)]
     #[rtype(result = "()")]
@@ -82,11 +91,20 @@ pub mod inbox {
 
     pub struct RouterActor {
         id: u8,
+        persist_file: fs::File,
     }
 
     impl RouterActor {
         pub fn new(id: u8) -> Self {
-            RouterActor { id }
+            RouterActor {
+                id,
+                persist_file: fs::OpenOptions::new()
+                    .read(false)
+                    .write(true)
+                    .create_new(true)
+                    .open(&format!("./persist-inbox/{}.bin", id))
+                    .unwrap(),
+            }
         }
     }
 
@@ -98,7 +116,12 @@ pub mod inbox {
         type Result = ();
 
         fn handle(&mut self, msg: InboxEpoch, _ctx: &mut Context<Self>) {
+            use std::io::Write;
+
             let InboxEpoch(state, epoch_id, shard_id, queue) = msg;
+
+            bincode::serialize_into(&mut self.persist_file, &PersistRecord::Epoch(epoch_id))
+                .unwrap();
 
             let mut intershard = vec![LinkedList::new(); state.intershard_router_actors.len()];
 
@@ -132,9 +155,17 @@ pub mod inbox {
                         seq,
                     };
 
+                    bincode::serialize_into(
+                        &mut self.persist_file,
+                        &PersistRecord::Message(Cow::Borrowed(&rt_msg)),
+                    )
+                    .unwrap();
+
                     intershard[bucket].push_back(rt_msg);
                 }
             }
+
+            self.persist_file.flush().unwrap();
 
             for (messages, intershard_rt) in intershard
                 .into_iter()
@@ -762,8 +793,11 @@ pub async fn init(
     outbox_count: u8,
 ) -> impl Fn(&mut web::ServiceConfig) + Clone + Send + 'static {
     use actix::{Actor, Addr, Arbiter};
+    use std::fs;
     use std::io::{self, Write};
     use tokio::sync::mpsc;
+
+    fs::create_dir("./persist-inbox").unwrap();
 
     let httpc = reqwest::Client::new();
     let mut arbiters = Vec::new();
