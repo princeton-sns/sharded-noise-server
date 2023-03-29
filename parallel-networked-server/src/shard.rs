@@ -120,7 +120,10 @@ pub mod inbox {
 
             let InboxEpoch(state, epoch_id, shard_id, queue) = msg;
 
-            bincode::serialize_into(&mut self.persist_file, &PersistRecord::Epoch(epoch_id))
+            // At least a few file system blocks, RAM is cheap
+            let mut writer = std::io::BufWriter::with_capacity(128 * 4069, &mut self.persist_file);
+
+            bincode::serialize_into(&mut writer, &PersistRecord::Epoch(epoch_id))
                 .unwrap();
 
             let mut intershard = vec![LinkedList::new(); state.intershard_router_actors.len()];
@@ -135,11 +138,6 @@ pub mod inbox {
 
                 for message in ev.bundle.batch.into_iter() {
                     let bucket = hash_into_bucket(&message.device_id, intershard.len(), true);
-                    println!(
-                        "Delivering message into bucket {} of {}",
-                        bucket,
-                        intershard.len()
-                    );
 
                     let seq = (
                         epoch_id,
@@ -156,7 +154,7 @@ pub mod inbox {
                     };
 
                     bincode::serialize_into(
-                        &mut self.persist_file,
+                        &mut writer,
                         &PersistRecord::Message(Cow::Borrowed(&rt_msg)),
                     )
                     .unwrap();
@@ -165,7 +163,7 @@ pub mod inbox {
                 }
             }
 
-            self.persist_file.flush().unwrap();
+            writer.flush().unwrap();
 
             for (messages, intershard_rt) in intershard
                 .into_iter()
@@ -702,11 +700,6 @@ fn hash_into_bucket(device_id: &str, bucket_count: usize, upper_bits: bool) -> u
     };
 
     let res = (hash % (bucket_count as u32)) as usize;
-
-    println!(
-        "Hash into bucket: {}, {}, {:?} -> {} -> {}",
-        device_id, bucket_count, upper_bits, hash, res
-    );
 
     res
 }
