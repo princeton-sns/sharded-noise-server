@@ -123,8 +123,7 @@ pub mod inbox {
             // At least a few file system blocks, RAM is cheap
             let mut writer = std::io::BufWriter::with_capacity(128 * 4069, &mut self.persist_file);
 
-            bincode::serialize_into(&mut writer, &PersistRecord::Epoch(epoch_id))
-                .unwrap();
+            bincode::serialize_into(&mut writer, &PersistRecord::Epoch(epoch_id)).unwrap();
 
             let mut intershard = vec![LinkedList::new(); state.intershard_router_actors.len()];
 
@@ -597,6 +596,14 @@ pub mod outbox {
     #[rtype(result = "DeviceMessages")]
     pub struct GetDeviceMessages(pub String);
 
+    #[derive(Message, Clone, Debug)]
+    #[rtype(result = "DeviceMessages")]
+    pub struct DeleteDeviceMessages(pub String, pub (u64, u64));
+
+    #[derive(Message, Clone, Debug)]
+    #[rtype(result = "DeviceMessages")]
+    pub struct ClearDeviceMessages(pub String);
+
     impl Handler<Initialize> for OutboxActor {
         type Result = ();
 
@@ -642,9 +649,53 @@ pub mod outbox {
                 .entry(msg.0)
                 .or_insert_with(|| (0, LinkedList::new()));
 
+            DeviceMessages(client_msgs.clone())
+        }
+    }
+
+    impl Handler<DeleteDeviceMessages> for OutboxActor {
+        type Result = DeviceMessages;
+
+        fn handle(&mut self, msg: DeleteDeviceMessages, _ctx: &mut Context<Self>) -> Self::Result {
+            let (ref mut client_next_epoch, ref mut client_msgs) = self
+                .client_mailboxes
+                .entry(msg.0)
+                .or_insert_with(|| (0, LinkedList::new()));
+
+            *client_next_epoch = self.next_epoch;
+
+            //FIX: use drain filter if we're ok with experimental
+            //let leftover_msgs = client_msgs.drain_filter(|x| *x.seq < msg.1).collect::<LinkedList<_>>();
+
+            let mut index = 0;
+            for m in client_msgs.clone().into_iter() {
+                if m.seq < msg.1 {
+                    index += 1;
+                } else {
+                    break;
+                }
+            }
+
+            let leftover_msgs = client_msgs.split_off(index);
+            let msgs = mem::replace(client_msgs, leftover_msgs);
+
+            DeviceMessages(msgs)
+        }
+    }
+
+    impl Handler<ClearDeviceMessages> for OutboxActor {
+        type Result = DeviceMessages;
+
+        fn handle(&mut self, msg: ClearDeviceMessages, _ctx: &mut Context<Self>) -> Self::Result {
+            let (ref mut client_next_epoch, ref mut client_msgs) = self
+                .client_mailboxes
+                .entry(msg.0)
+                .or_insert_with(|| (0, LinkedList::new()));
+
             *client_next_epoch = self.next_epoch;
 
             let msgs = mem::replace(client_msgs, LinkedList::new());
+
             DeviceMessages(msgs)
         }
     }
@@ -733,6 +784,44 @@ async fn handle_message(
 }
 
 #[delete("/outbox")]
+async fn clear_messages(
+    state: web::Data<ShardState>,
+    auth: web::Header<BearerToken>,
+) -> impl Responder {
+    let device_id = auth.into_inner().into_token();
+    let outbox_actors_cnt = state.outbox_actors.len();
+    let actor_idx = hash_into_bucket(&device_id, outbox_actors_cnt, false);
+
+    let messages = state.outbox_actors[actor_idx]
+        .1
+        .send(outbox::ClearDeviceMessages(device_id))
+        .await
+        .unwrap();
+
+    web::Json(messages.0)
+}
+
+// TODO: find opt param setup and combine with above
+#[delete("/outbox/{seq_high}/{seq_low}")]
+async fn delete_messages(
+    state: web::Data<ShardState>,
+    auth: web::Header<BearerToken>,
+    msg_id: web::Path<(u64, u64)>,
+) -> impl Responder {
+    let device_id = auth.into_inner().into_token();
+    let outbox_actors_cnt = state.outbox_actors.len();
+    let actor_idx = hash_into_bucket(&device_id, outbox_actors_cnt, false);
+
+    let messages = state.outbox_actors[actor_idx]
+        .1
+        .send(outbox::DeleteDeviceMessages(device_id, *msg_id))
+        .await
+        .unwrap();
+
+    web::Json(messages.0)
+}
+
+#[get("/outbox")]
 async fn retrieve_messages(
     state: web::Data<ShardState>,
     auth: web::Header<BearerToken>,
@@ -749,7 +838,6 @@ async fn retrieve_messages(
 
     web::Json(messages.0)
 }
-
 #[post("/epoch/{epoch_id}")]
 async fn start_epoch(state: web::Data<ShardState>, epoch_id: web::Path<u64>) -> impl Responder {
     // println!("Received start_epoch request: {}", *epoch_id);
@@ -968,6 +1056,8 @@ pub async fn init(
             // Client API
             .service(handle_message)
             .service(retrieve_messages)
+            .service(delete_messages)
+            .service(clear_messages)
             // Sequencer API
             .service(start_epoch)
             .service(index)
