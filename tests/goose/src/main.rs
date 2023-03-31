@@ -9,6 +9,7 @@ use rand::seq::SliceRandom;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Serialize;
 use serde_json::json;
+use goose_eggs::{validate_and_load_static_assets, Validate};
 
 static LETTERS: [&str; 26] = [
     "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s",
@@ -28,14 +29,25 @@ async fn main() -> Result<(), GooseError> {
     .register_scenario(
         scenario!("DeleteOneMailbox")
             .register_transaction(transaction!(set_username).set_name("generate username"))
-            .register_transaction(transaction!(delete_mailbox_content).set_name("delete mailbox")),
+            .register_transaction(transaction!(delete_mailbox).set_name("delete mailbox")),
     )
     .register_scenario(
-        scenario!("DeletePostDelete")
+        scenario!("GetOneMailbox")
+        .register_transaction(transaction!(set_username).set_name("generate username"))
+        .register_transaction(transaction!(get_mailbox).set_name("get mailbox"))
+    )
+    .register_scenario(
+        scenario!("DeletePostGetDelete")
             .register_transaction(transaction!(set_username).set_name("generate username"))
-            .register_transaction(transaction!(delete_mailbox_content).set_name("delete mailbox"))
+            .register_transaction(transaction!(delete_mailbox).set_name("delete mailbox"))
             .register_transaction(transaction!(post_message).set_name("post request"))
-            .register_transaction(transaction!(delete_mailbox_content).set_name("delete mailbox")),
+            .register_transaction(transaction!(get_mailbox).set_name("get mailbox"))
+            .register_transaction(transaction!(delete_mailbox).set_name("delete mailbox")),
+    )
+    .register_scenario(
+        scenario!("ValidateGetMessageAfterPost")
+            .register_transaction(transaction!(set_username).set_name("generate username"))
+            .register_transaction(transaction!(loop_message).set_name("loop message"))
     )
     .execute()
     .await?;
@@ -97,7 +109,29 @@ async fn post_message(user: &mut GooseUser) -> TransactionResult {
     Ok(())
 }
 
-async fn delete_mailbox_content(user: &mut GooseUser) -> TransactionResult {
+async fn get_mailbox(user: &mut GooseUser) -> TransactionResult {
+    let username = &user.get_session_data::<Username>().unwrap().0;
+
+    let mut headers = HeaderMap::new();
+    let auth_name = "Bearer ".to_owned() + username.as_str();
+    headers.insert("Authorization", HeaderValue::from_str(&auth_name).unwrap());
+
+    let request_builder = user
+        .get_request_builder(&GooseMethod::Get, "/outbox")?
+        .headers(headers);
+
+    let goose_request = GooseRequest::builder()
+        .method(GooseMethod::Get)
+        .path("/outbox")
+        .set_request_builder(request_builder)
+        .build();
+
+    let _goose_metrics = user.request(goose_request).await;
+
+    Ok(())
+}
+
+async fn delete_mailbox(user: &mut GooseUser) -> TransactionResult {
     let username = &user.get_session_data::<Username>().unwrap().0;
 
     let mut headers = HeaderMap::new();
@@ -117,4 +151,63 @@ async fn delete_mailbox_content(user: &mut GooseUser) -> TransactionResult {
     let _goose_metrics = user.request(goose_request).await;
 
     Ok(())
+}
+
+async fn loop_message(user: &mut GooseUser) -> TransactionResult {
+
+    // SEND MESSAGE TO SELF
+    let sender = &user.get_session_data::<Username>().unwrap().0;
+
+    let mut headers = HeaderMap::new();
+    let auth_name = "Bearer ".to_owned() + &sender;
+    headers.insert("Authorization", HeaderValue::from_str(&auth_name).unwrap());
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_str("application/json").unwrap(),
+    );
+
+    let post_request_builder = user
+        .get_request_builder(&GooseMethod::Post, "/message")?
+        .headers(headers.clone());
+
+    let data = json!(
+    {
+        "batch":
+        [
+        {"deviceId": sender,
+        "payload": {"cType":0, "ciphertext": "Text to Validate"}},
+        ]
+    });
+
+    let post_request = GooseRequest::builder()
+        .method(GooseMethod::Post)
+        .path("/message")
+        .set_request_builder(post_request_builder.json(&data))
+        .build();
+
+    let _goose_metrics = user.request(post_request).await;
+
+    
+    //// GET MESSAGE BACK
+    let get_request_builder = user
+        .get_request_builder(&GooseMethod::Get, "/outbox")?
+        .headers(headers);
+
+    let get_request = GooseRequest::builder()
+        .method(GooseMethod::Get)
+        .path("/outbox")
+        .set_request_builder(get_request_builder)
+        .build();
+
+    let resp = user.request(get_request).await?;
+
+    let validate = &Validate::builder()
+    .status(200)
+    .text("Text to Validate")
+    .build();
+
+    validate_and_load_static_assets(user, resp, &validate).await?;
+
+    Ok(())
+
 }

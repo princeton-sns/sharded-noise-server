@@ -530,10 +530,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "goose-eggs"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83532d04a1a2d2dc0551383105ca18a3fa7e950e7e92c0012a2bdfa9f2ba637a"
+dependencies = [
+ "goose",
+ "log",
+ "rand",
+ "regex",
+ "reqwest",
+ "tokio",
+]
+
+[[package]]
 name = "goose-tests"
 version = "0.1.0"
 dependencies = [
  "goose",
+ "goose-eggs",
  "rand",
  "random-string",
  "reqwest",
