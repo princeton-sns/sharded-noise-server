@@ -1,4 +1,4 @@
-use actix::{Actor, Addr};
+use actix::{Actor, Addr, Arbiter};
 use actix_web::{
     delete, error, get, http::header, post, web, HttpMessage, HttpResponse, Responder,
 };
@@ -265,7 +265,7 @@ pub mod inbox {
 pub mod intershard {
     use actix::{Actor, Context, Handler, Message, ResponseFuture};
     use serde::{Deserialize, Serialize};
-    use std::collections::LinkedList;
+
     use std::mem;
 
     use std::sync::Arc;
@@ -702,7 +702,7 @@ pub mod outbox {
         ) -> Self::Result {
             let DeviceEpochBatch(epoch_id, device_messages, message_count) = epoch_batch;
 
-            for (device, mut messages) in device_messages.into_iter() {
+            for (device, messages) in device_messages.into_iter() {
                 if let Some(tx) = self.client_streams.get_mut(&device) {
                     tx.try_send(sse::Data::new("got message!")).unwrap();
                 }
@@ -752,7 +752,7 @@ pub mod outbox {
         type Result = DeviceMessages;
 
         fn handle(&mut self, msg: GetDeviceMessages, _ctx: &mut Context<Self>) -> Self::Result {
-            let (ref mut client_next_epoch, ref mut client_msgs) = self
+            let (ref mut _client_next_epoch, ref mut client_msgs) = self
                 .client_mailboxes
                 .entry(msg.0)
                 .or_insert_with(|| (0, LinkedList::new()));
@@ -1011,7 +1011,6 @@ pub async fn init(
     inbox_count: u8,
     outbox_count: u8,
 ) -> impl Fn(&mut web::ServiceConfig) + Clone + Send + 'static {
-    use actix::{Actor, Addr, Arbiter};
     use std::fs;
     use std::io::{self, Write};
     use tokio::sync::mpsc;
@@ -1080,7 +1079,7 @@ pub async fn init(
         let router_arbiter = Arbiter::new();
         assert!(router_arbiter.spawn(async move {
             let addr = inbox::RouterActor::new(id).start();
-            router_tx.send(addr).await;
+            router_tx.send(addr).await.unwrap();
         }));
         arbiters.push(router_arbiter);
         let router = router_rx.recv().await.unwrap();
@@ -1089,7 +1088,7 @@ pub async fn init(
         let inbox_arbiter = Arbiter::new();
         assert!(inbox_arbiter.spawn(async move {
             let addr = inbox::InboxActor::new(id, router).start();
-            inbox_tx.send(addr).await;
+            inbox_tx.send(addr).await.unwrap();
         }));
         arbiters.push(inbox_arbiter);
 
@@ -1104,7 +1103,7 @@ pub async fn init(
         assert!(isr_arbiter.spawn(async move {
             let addr =
                 intershard::InterShardRouterActor::new(register_resp.shard_id, id as u8).start();
-            isr_tx.send(addr).await;
+            isr_tx.send(addr).await.unwrap();
         }));
         arbiters.push(isr_arbiter);
         intershard_router_actors.push(isr_rx.recv().await.unwrap());
@@ -1116,10 +1115,10 @@ pub async fn init(
     for id in 0..outbox_count {
         let (outbox_tx, mut outbox_rx) = mpsc::channel(1);
         let outbox_arbiter = Arbiter::new();
-        let sequencer_clone = sequencer_base_url.clone();
+        let _sequencer_clone = sequencer_base_url.clone();
         assert!(outbox_arbiter.spawn(async move {
             let addr = outbox::OutboxActor::new(id).start();
-            outbox_tx.send(addr).await;
+            outbox_tx.send(addr).await.unwrap();
         }));
         arbiters.push(outbox_arbiter);
         let outbox_addr = outbox_rx.recv().await.unwrap();
@@ -1129,7 +1128,7 @@ pub async fn init(
         let outbox_addr_clone = outbox_addr.clone();
         assert!(recv_arbiter.spawn(async move {
             let addr = outbox::ReceiverActor::new(id, outbox_addr_clone).start();
-            recv_tx.send(addr).await;
+            recv_tx.send(addr).await.unwrap();
         }));
         arbiters.push(recv_arbiter);
 
@@ -1140,7 +1139,7 @@ pub async fn init(
     let collector_arbiter = Arbiter::new();
     assert!(collector_arbiter.spawn(async move {
         let addr = intershard::EpochCollectorActor::new().start();
-        collector_tx.send(addr).await;
+        collector_tx.send(addr).await.unwrap();
     }));
     arbiters.push(collector_arbiter);
     let epoch_collector_actor = collector_rx.recv().await.unwrap();

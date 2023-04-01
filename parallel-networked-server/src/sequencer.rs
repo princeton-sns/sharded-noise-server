@@ -214,8 +214,9 @@ impl Handler<EndEpochReq> for SequencerActor {
             }),
         )
         .unwrap();
-        self.epoch_log.write(b"\n");
-        self.epoch_log.flush();
+        // TODO: buffered writer here?
+        self.epoch_log.write(b"\n").unwrap();
+        self.epoch_log.flush().unwrap();
 
         if self
             .shard_addresses
