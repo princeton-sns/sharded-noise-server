@@ -3,6 +3,7 @@ use actix::{
 };
 use actix_web::{get, post, web, HttpResponse, Responder};
 use serde::{Deserialize, Serialize};
+use serde_json;
 
 #[derive(Message, Serialize, Deserialize, Clone, Debug)]
 #[rtype(result = "SequencerRegisterResp")]
@@ -30,6 +31,7 @@ pub struct SequencerShardMapResp(Option<SequencerShardMap>);
 pub struct EndEpochReq {
     pub shard_id: u8,
     pub epoch_id: u64,
+    pub received_messages: usize,
 }
 
 #[derive(Message, Clone, Debug)]
@@ -44,10 +46,24 @@ pub struct ProbeShards;
 #[rtype(result = "()")]
 pub struct EpochStart(u64);
 
+#[derive(Serialize)]
+#[serde(tag = "type")]
+pub enum EpochLogEntry {
+    ShardEpochFinish(ShardEpochFinishLogEntry),
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ShardEpochFinishLogEntry {
+    shard_id: u8,
+    epoch_id: u64,
+    epoch_duration_us: u128,
+    received_messages: usize,
+}
+
 enum Phase {
     Registration,
     Bootup,
-    Sequencing(u64),
+    Sequencing(u64, std::time::Instant),
 }
 
 pub struct SequencerActor {
@@ -55,15 +71,26 @@ pub struct SequencerActor {
     shard_addresses: Vec<(bool, String)>,
     phase: Phase,
     client: reqwest::Client,
+    epoch_log: std::fs::File,
 }
 
 impl SequencerActor {
     pub fn new(num_shards: u8) -> Self {
+        println!("Starting SequencerActor");
+
+        let epoch_log = std::fs::OpenOptions::new()
+            .read(false)
+            .write(true)
+            .create_new(true)
+            .open("./epoch_log.txt")
+            .unwrap();
+
         SequencerActor {
             num_shards,
             shard_addresses: vec![],
             phase: Phase::Registration,
             client: reqwest::Client::new(),
+            epoch_log,
         }
     }
 }
@@ -80,10 +107,12 @@ impl Handler<SequencerRegisterReq> for SequencerActor {
         msg: SequencerRegisterReq,
         ctx: &mut Context<Self>,
     ) -> SequencerRegisterResp {
+        println!("Received SequencerRegisterReq");
         self.shard_addresses.push((false, msg.base_url));
 
         if self.shard_addresses.len() == self.num_shards as usize {
             ctx.notify_later(ProbeShards, std::time::Duration::from_secs(1));
+            println!("All shards registered, transitioning to bootup");
             self.phase = Phase::Bootup;
         }
 
@@ -110,6 +139,8 @@ impl Handler<ProbeShards> for SequencerActor {
                 }
             }
 
+            println!("All shards are reachable, initiating epoch 0");
+
             for (_, addr) in adds {
                 println!("Requesting epoch start");
                 httpc
@@ -129,9 +160,9 @@ impl Handler<EpochStart> for SequencerActor {
 
     fn handle(&mut self, msg: EpochStart, _ctx: &mut Context<Self>) -> Self::Result {
         let EpochStart(epoch_id) = msg;
-        self.phase = Phase::Sequencing(epoch_id);
+        self.phase = Phase::Sequencing(epoch_id, std::time::Instant::now());
 
-        println!("Start epoch {}", epoch_id);
+        // println!("Start epoch {}", epoch_id);
         self.shard_addresses
             .iter_mut()
             .for_each(|(finished, _)| *finished = false);
@@ -142,13 +173,13 @@ impl Handler<EpochStart> for SequencerActor {
         Box::pin(async move {
             for (_, addr) in adds {
                 // TODO: parallelize
-                println!("Requesting epoch start");
+                // println!("Requesting epoch start");
                 httpc
                     .post(format!("{}/epoch/{}", addr, epoch_id))
                     .send()
                     .await
                     .unwrap();
-                println!("Request done");
+                // println!("Request done");
             }
         })
     }
@@ -158,15 +189,33 @@ impl Handler<EndEpochReq> for SequencerActor {
     type Result = ();
 
     fn handle(&mut self, msg: EndEpochReq, ctx: &mut Context<Self>) -> Self::Result {
-        match &self.phase {
-            Phase::Sequencing(epoch_id) => {
+        let epoch_start_time = match &self.phase {
+            Phase::Sequencing(epoch_id, start_time) => {
                 assert!(*epoch_id == msg.epoch_id + 1);
+                start_time
             }
             _ => panic!("Not yet sequencing"),
         };
 
         assert!(!self.shard_addresses[msg.shard_id as usize].0);
         self.shard_addresses[msg.shard_id as usize].0 = true;
+
+        // Log that this shard has finished its epoch:
+        use std::io::Write;
+        serde_json::to_writer(
+            &mut self.epoch_log,
+            &EpochLogEntry::ShardEpochFinish(ShardEpochFinishLogEntry {
+                shard_id: msg.shard_id,
+                epoch_id: msg.epoch_id,
+                epoch_duration_us: std::time::Instant::now()
+                    .duration_since(*epoch_start_time)
+                    .as_micros(),
+                received_messages: msg.received_messages,
+            }),
+        )
+        .unwrap();
+        self.epoch_log.write(b"\n");
+        self.epoch_log.flush();
 
         if self
             .shard_addresses

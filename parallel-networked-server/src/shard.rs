@@ -433,7 +433,7 @@ pub mod intershard {
     pub struct EpochCollectorActor {
         state: Option<Arc<super::ShardState>>,
         epoch: Option<u64>,
-        input_queues: (usize, Vec<bool>),
+        input_queues: (usize, Vec<Option<usize>>),
     }
 
     impl EpochCollectorActor {
@@ -455,7 +455,7 @@ pub mod intershard {
 
         fn handle(&mut self, msg: Initialize, _ctx: &mut Context<Self>) -> Self::Result {
             let Initialize(state) = msg;
-            self.input_queues = (0, vec![false; state.outbox_actors.len()]);
+            self.input_queues = (0, vec![None; state.outbox_actors.len()]);
             self.state = Some(state);
         }
     }
@@ -470,9 +470,10 @@ pub mod intershard {
         ) -> Self::Result {
             let outbox_id = msg.1;
             let epoch = msg.0;
+            let epoch_messages = msg.2;
 
-            assert!(!self.input_queues.1[outbox_id as usize]);
-            self.input_queues.1[outbox_id as usize] = true;
+            assert!(self.input_queues.1[outbox_id as usize].is_none());
+            self.input_queues.1[outbox_id as usize] = Some(epoch_messages);
             self.input_queues.0 += 1;
 
             if let Some(cur_epoch) = self.epoch {
@@ -486,9 +487,11 @@ pub mod intershard {
                 let self_shard_id = self.state.as_ref().unwrap().shard_id;
                 let httpc = self.state.as_ref().unwrap().httpc.clone();
 
+                let received_messages = self.input_queues.1.iter().map(|orm| orm.unwrap()).sum();
+
                 self.input_queues = (
                     0,
-                    vec![false; self.state.as_ref().unwrap().outbox_actors.len()],
+                    vec![None; self.state.as_ref().unwrap().outbox_actors.len()],
                 );
                 self.epoch = None;
 
@@ -499,6 +502,7 @@ pub mod intershard {
                         .json(&crate::sequencer::EndEpochReq {
                             shard_id: self_shard_id,
                             epoch_id: epoch,
+                            received_messages,
                         })
                         .send()
                         .await
@@ -520,7 +524,7 @@ pub mod outbox {
 
     #[derive(Message, Clone)]
     #[rtype(result = "()")]
-    pub struct EndEpoch(pub u64, pub u8);
+    pub struct EndEpoch(pub u64, pub u8, pub usize);
 
     #[derive(Message, Clone)]
     #[rtype(result = "()")]
@@ -608,8 +612,11 @@ pub mod outbox {
                 // Shrink back all inserted overallocated Vecs:
                 output_map.iter_mut().for_each(|(_k, v)| v.shrink_to_fit());
 
-                self.outbox_address
-                    .do_send(DeviceEpochBatch(epoch_id, output_map))
+                self.outbox_address.do_send(DeviceEpochBatch(
+                    epoch_id,
+                    output_map,
+                    epoch_message_count,
+                ))
             }
         }
     }
@@ -652,6 +659,7 @@ pub mod outbox {
     pub struct DeviceEpochBatch(
         pub u64,
         pub HashMap<String, Vec<super::client_protocol::OutboxMessage>>,
+        pub usize,
     );
 
     #[derive(MessageResponse)]
@@ -692,7 +700,7 @@ pub mod outbox {
             epoch_batch: DeviceEpochBatch,
             _ctx: &mut Context<Self>,
         ) -> Self::Result {
-            let DeviceEpochBatch(epoch_id, device_messages) = epoch_batch;
+            let DeviceEpochBatch(epoch_id, device_messages, message_count) = epoch_batch;
 
             for (device, mut messages) in device_messages.into_iter() {
                 if let Some(tx) = self.client_streams.get_mut(&device) {
@@ -714,7 +722,7 @@ pub mod outbox {
                 .as_ref()
                 .unwrap()
                 .epoch_collector_actor
-                .do_send(super::outbox::EndEpoch(epoch_id, self.id));
+                .do_send(super::outbox::EndEpoch(epoch_id, self.id, message_count));
         }
     }
 
