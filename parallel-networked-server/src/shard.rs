@@ -125,13 +125,13 @@ pub mod inbox {
 
             bincode::serialize_into(&mut writer, &PersistRecord::Epoch(epoch_id)).unwrap();
 
-	    // Allocate a bunch of vectors for the individual intershard
-	    // routers. We preallocate the maximum capacity (queue_length) for
-	    // each and rely on the OS performing lazy zero-page CoW allocation
-	    // to avoid excessive memory consumption. This allows us to avoid
-	    // per-message allocations (LinkedList) or re-allocating the vectors.
+            // Allocate a bunch of vectors for the individual intershard
+            // routers. We preallocate the maximum capacity (queue_length) for
+            // each and rely on the OS performing lazy zero-page CoW allocation
+            // to avoid excessive memory consumption. This allows us to avoid
+            // per-message allocations (LinkedList) or re-allocating the vectors.
             let mut intershard = vec![vec![]; state.intershard_router_actors.len()];
-	    intershard.iter_mut().for_each(|v| v.reserve(queue_length));
+            intershard.iter_mut().for_each(|v| v.reserve(queue_length));
 
             for (idx, ev) in queue.into_iter().enumerate() {
                 let receivers: Vec<_> = ev
@@ -224,7 +224,7 @@ pub mod inbox {
             if let Some(ref epoch_id) = self.epoch {
                 // Simply add the event to the queue:
                 self.queue.1.push_back(ev);
-		self.queue.0 += 1;
+                self.queue.0 += 1;
                 Ok(*epoch_id)
             } else {
                 Err(EventError::NoEpoch)
@@ -288,7 +288,6 @@ pub mod intershard {
         pub messages: Vec<Vec<super::client_protocol::OutboxMessage>>,
     }
 
-
     #[derive(Message, Clone)]
     #[rtype(result = "()")]
     pub struct Initialize(pub Arc<super::ShardState>);
@@ -341,14 +340,21 @@ pub mod intershard {
 
             // check if every element of input_queus has been written to
             if self.input_queues.0 == self.input_queues.1.len() {
-		// Replace the input queus:
-                let input_queues = mem::replace(&mut self.input_queues, (
-                    0,
-                    vec![None; self.state.as_ref().unwrap().inbox_actors.len()],
-                ));
+                // Replace the input queus:
+                let input_queues = mem::replace(
+                    &mut self.input_queues,
+                    (
+                        0,
+                        vec![None; self.state.as_ref().unwrap().inbox_actors.len()],
+                    ),
+                );
 
-		// To avoid copying, build a 2D vector of input queues to serialize:
-		let shard_batch = input_queues.1.into_iter().map(|oq| oq.unwrap().messages).collect();
+                // To avoid copying, build a 2D vector of input queues to serialize:
+                let shard_batch = input_queues
+                    .1
+                    .into_iter()
+                    .map(|oq| oq.unwrap().messages)
+                    .collect();
 
                 if self.src_shard_id == self.dst_shard_id {
                     distribute_intershard_batch(
@@ -387,27 +393,30 @@ pub mod intershard {
         }
     }
 
-    pub fn distribute_intershard_batch(state: &super::ShardState, batch: IntershardRoutedEpochBatch) {
+    pub fn distribute_intershard_batch(
+        state: &super::ShardState,
+        batch: IntershardRoutedEpochBatch,
+    ) {
         assert!(batch.dst_shard_id == state.shard_id);
 
-	// Allocate a bunch of vectors for the individual outbox receivers. We
-	// preallocate the maximum capacity (queue_length) for each and rely on
-	// the OS performing lazy zero-page CoW allocation to avoid excessive
-	// memory consumption. This allows us to avoid per-message allocations
-	// (LinkedList) or re-allocating the vectors.
-	let batch_size = batch.messages.iter().map(|v| v.len()).sum();
+        // Allocate a bunch of vectors for the individual outbox receivers. We
+        // preallocate the maximum capacity (queue_length) for each and rely on
+        // the OS performing lazy zero-page CoW allocation to avoid excessive
+        // memory consumption. This allows us to avoid per-message allocations
+        // (LinkedList) or re-allocating the vectors.
+        let batch_size = batch.messages.iter().map(|v| v.len()).sum();
         let mut outboxes = vec![Vec::new(); state.outbox_actors.len()];
-	outboxes.iter_mut().for_each(|v| v.reserve(batch_size));
+        outboxes.iter_mut().for_each(|v| v.reserve(batch_size));
 
         for message in batch.messages.into_iter().flat_map(|v| v.into_iter()) {
             let bucket = super::hash_into_bucket(&message.payload.device_id, outboxes.len(), false);
             outboxes[bucket].push(message);
         }
 
-	// Now free up any unused memory. This shouldn't move the vector on the
-	// heap, but perhaps enable some new allocations, especially if the
-	// actual number of messages delivered to an outbox was very small.
-	outboxes.iter_mut().for_each(|v| v.shrink_to_fit());
+        // Now free up any unused memory. This shouldn't move the vector on the
+        // heap, but perhaps enable some new allocations, especially if the
+        // actual number of messages delivered to an outbox was very small.
+        outboxes.iter_mut().for_each(|v| v.shrink_to_fit());
 
         for (messages, outbox) in outboxes.into_iter().zip(state.outbox_actors.iter()) {
             let routed_batch = RoutedEpochBatch {
@@ -504,6 +513,7 @@ pub mod intershard {
 
 pub mod outbox {
     use actix::{Actor, Addr, Context, Handler, Message, MessageResponse};
+    use actix_web_lab::sse::{self, ChannelStream, Sse};
     use std::collections::{HashMap, LinkedList};
     use std::mem;
     use std::sync::Arc;
@@ -565,28 +575,38 @@ pub mod outbox {
             if self.input_queues.0 == self.input_queues.1.len() {
                 let mut output_map = HashMap::new();
 
-		let input_queues = mem::replace(
+                let input_queues = mem::replace(
                     &mut self.input_queues,
                     (0, vec![None; self.state.as_ref().unwrap().shard_map.len()]),
                 );
 
-		let epoch_message_count = input_queues.1.iter().map(|ov| ov.as_ref().map(|b| b.messages.len()).unwrap()).sum();
+                let epoch_message_count = input_queues
+                    .1
+                    .iter()
+                    .map(|ov| ov.as_ref().map(|b| b.messages.len()).unwrap())
+                    .sum();
 
-		for b in input_queues.1.into_iter() {
+                for b in input_queues.1.into_iter() {
                     let batch = b.unwrap();
                     for message in batch.messages.into_iter() {
-			// Use this instead of .entry().or_insert_with() to
-			// avoid unconditionally cloning the device_id string:
-			if !output_map.contains_key(&message.payload.device_id) {
-			    output_map.insert(message.payload.device_id.clone(), Vec::with_capacity(epoch_message_count));
-			}
+                        // Use this instead of .entry().or_insert_with() to
+                        // avoid unconditionally cloning the device_id string:
+                        if !output_map.contains_key(&message.payload.device_id) {
+                            output_map.insert(
+                                message.payload.device_id.clone(),
+                                Vec::with_capacity(epoch_message_count),
+                            );
+                        }
 
-                        output_map.get_mut(&message.payload.device_id).unwrap().push(message);
+                        output_map
+                            .get_mut(&message.payload.device_id)
+                            .unwrap()
+                            .push(message);
                     }
                 }
 
-		// Shrink back all inserted overallocated Vecs:
-		output_map.iter_mut().for_each(|(_k, v)| v.shrink_to_fit());
+                // Shrink back all inserted overallocated Vecs:
+                output_map.iter_mut().for_each(|(_k, v)| v.shrink_to_fit());
 
                 self.outbox_address
                     .do_send(DeviceEpochBatch(epoch_id, output_map))
@@ -600,8 +620,15 @@ pub mod outbox {
         // Mapping from device key to the next epoch which has not
         // been exposed to the client, and all messages from including
         // this message)
-        client_mailboxes: HashMap<String, (u64, LinkedList<(u64, Vec<super::client_protocol::OutboxMessage>)>)>,
+        client_mailboxes: HashMap<
+            String,
+            (
+                u64,
+                LinkedList<(u64, Vec<super::client_protocol::OutboxMessage>)>,
+            ),
+        >,
         state: Option<Arc<super::ShardState>>,
+        client_streams: HashMap<String, sse::Sender>,
     }
 
     impl OutboxActor {
@@ -611,6 +638,7 @@ pub mod outbox {
                 next_epoch: 0,
                 client_mailboxes: HashMap::new(),
                 state: None,
+                client_streams: HashMap::new(),
             }
         }
     }
@@ -632,6 +660,13 @@ pub mod outbox {
     #[derive(Message, Clone, Debug)]
     #[rtype(result = "DeviceMessages")]
     pub struct GetDeviceMessages(pub String);
+
+    #[derive(Message, Clone, Debug)]
+    #[rtype(result = "DeviceMessageStream")]
+    pub struct GetDeviceMessageStream(pub String);
+
+    #[derive(MessageResponse, Debug)]
+    pub struct DeviceMessageStream(pub Sse<ChannelStream>);
 
     #[derive(Message, Clone, Debug)]
     #[rtype(result = "DeviceMessages")]
@@ -660,11 +695,15 @@ pub mod outbox {
             let DeviceEpochBatch(epoch_id, device_messages) = epoch_batch;
 
             for (device, mut messages) in device_messages.into_iter() {
+                if let Some(tx) = self.client_streams.get_mut(&device) {
+                    tx.try_send(sse::Data::new("got message!")).unwrap();
+                }
+
                 if let Some((_, ref mut device_mailbox)) = self.client_mailboxes.get_mut(&device) {
                     device_mailbox.push_back((epoch_id, messages));
                 } else {
-		    let mut message_queue = LinkedList::new();
-		    message_queue.push_back((epoch_id, messages));
+                    let mut message_queue = LinkedList::new();
+                    message_queue.push_back((epoch_id, messages));
                     self.client_mailboxes.insert(device, (0, message_queue));
                 }
             }
@@ -679,6 +718,28 @@ pub mod outbox {
         }
     }
 
+    impl Handler<GetDeviceMessageStream> for OutboxActor {
+        type Result = DeviceMessageStream;
+
+        fn handle(
+            &mut self,
+            msg: GetDeviceMessageStream,
+            _ctx: &mut Context<Self>,
+        ) -> Self::Result {
+            let GetDeviceMessageStream(client_id) = msg;
+
+            // TODO: flush current messages onto the channel? This will probably
+            // block for too long. We may want to provide the client some
+            // indication the epoch at which we start streaming, and then the
+            // client can fetch those messages through a separate endpoint.
+
+            let (tx, rx) = sse::channel(10);
+            self.client_streams.insert(client_id, tx);
+
+            DeviceMessageStream(rx)
+        }
+    }
+
     impl Handler<GetDeviceMessages> for OutboxActor {
         type Result = DeviceMessages;
 
@@ -688,7 +749,12 @@ pub mod outbox {
                 .entry(msg.0)
                 .or_insert_with(|| (0, LinkedList::new()));
 
-            DeviceMessages(client_msgs.into_iter().flat_map(|(_, v)| v.into_iter().map(|m| m.clone())).collect())
+            DeviceMessages(
+                client_msgs
+                    .into_iter()
+                    .flat_map(|(_, v)| v.into_iter().map(|m| m.clone()))
+                    .collect(),
+            )
         }
     }
 
@@ -718,7 +784,11 @@ pub mod outbox {
             let leftover_msgs = client_msgs.split_off(index);
             let msgs = mem::replace(client_msgs, leftover_msgs);
 
-            DeviceMessages(msgs.into_iter().flat_map(|(_, v)| v.into_iter().map(|m| m.clone())).collect())
+            DeviceMessages(
+                msgs.into_iter()
+                    .flat_map(|(_, v)| v.into_iter().map(|m| m.clone()))
+                    .collect(),
+            )
         }
     }
 
@@ -735,7 +805,11 @@ pub mod outbox {
 
             let msgs = mem::replace(client_msgs, LinkedList::new());
 
-            DeviceMessages(msgs.into_iter().flat_map(|(_, v)| v.into_iter().map(|m| m.clone())).collect())
+            DeviceMessages(
+                msgs.into_iter()
+                    .flat_map(|(_, v)| v.into_iter().map(|m| m.clone()))
+                    .collect(),
+            )
         }
     }
 }
@@ -820,6 +894,23 @@ async fn handle_message(
         .unwrap();
 
     web::Json::<u64>(epoch)
+}
+
+#[get("/events")]
+async fn stream_messages(
+    state: web::Data<ShardState>,
+    auth: web::Header<BearerToken>,
+) -> impl Responder {
+    let device_id = auth.into_inner().into_token();
+    let outbox_actors_cnt = state.outbox_actors.len();
+    let actor_idx = hash_into_bucket(&device_id, outbox_actors_cnt, false);
+
+    state.outbox_actors[actor_idx]
+        .1
+        .send(outbox::GetDeviceMessageStream(device_id))
+        .await
+        .unwrap()
+        .0
 }
 
 #[delete("/outbox")]
@@ -1097,6 +1188,7 @@ pub async fn init(
             .service(retrieve_messages)
             .service(delete_messages)
             .service(clear_messages)
+            .service(stream_messages)
             // Sequencer API
             .service(start_epoch)
             .service(index)
