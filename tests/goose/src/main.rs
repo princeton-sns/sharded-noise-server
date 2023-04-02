@@ -9,7 +9,7 @@ use goose_eggs::{validate_and_load_static_assets, Validate};
 use rand::seq::SliceRandom;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 // static LETTERS: [&str; 26] = [
 //     "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s",
@@ -19,6 +19,7 @@ use serde_json::json;
 
 // Horribly unsafe AND unsound, never do this, this WILL break, it's terrible.
 static mut USERNAMES: Option<Vec<String>> = None;
+static mut FRIENDS: Option<Vec<String>> = None;
 
 #[tokio::main]
 async fn main() -> Result<(), GooseError> {
@@ -30,6 +31,13 @@ async fn main() -> Result<(), GooseError> {
         .unwrap();
     let usernames = usernames_str.split(":").map(|s| s.to_string()).collect();
     unsafe { USERNAMES = Some(usernames) };
+
+    let friends_str = std::env::vars()
+        .find(|(var, _)| var == "FRIENDS")
+        .map(|(_, val)| val)
+        .unwrap();
+    let friends: Vec<String> = friends_str.split(":").map(|s| s.to_string()).collect();
+    unsafe { FRIENDS = Some(friends) }
 
     g.register_scenario(
         scenario!("PostToOneUserAndSelf")
@@ -68,6 +76,26 @@ async fn main() -> Result<(), GooseError> {
 #[derive(Serialize)]
 struct Username(String);
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Payload {
+    pub c_type: usize,
+    pub ciphertext: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Message {
+    pub device_id: String,
+    pub payload: Payload,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Bundle {
+    pub batch: Vec<Message>,
+}
+
 // fn generate_username() -> String {
 //     let Some(letter) = LETTERS.choose(&mut rand::thread_rng()) else {todo!()};
 //     let Some(number) = NUMBERS.choose(&mut rand::thread_rng()) else {todo!()};
@@ -88,9 +116,45 @@ async fn set_username(user: &mut GooseUser) -> TransactionResult {
     Ok(())
 }
 
+//can optimize if the same for everyone
+fn construct_message(sender: String, friends: Vec<String>) -> Bundle {
+    let payload = Payload {
+        c_type: 0,
+        ciphertext: "hello world".to_string(),
+    };
+
+    let mut batch = Vec::new();
+
+    batch.push(Message {
+        device_id: sender,
+        payload: payload.clone(),
+    });
+    for f in friends {
+        batch.push(Message {
+            device_id: f,
+            payload: payload.clone(),
+        })
+    }
+
+    return Bundle { batch };
+}
+
+fn generate_friends(num_friends: usize) -> Vec<String> {
+    let mut friends = Vec::new();
+
+    for i in 0..num_friends {
+        friends.push(
+            unsafe { FRIENDS.as_ref().unwrap() }
+                .choose(&mut rand::thread_rng())
+                .unwrap()
+                .clone(),
+        )
+    }
+    return friends;
+}
+
 async fn post_message(user: &mut GooseUser) -> TransactionResult {
     let sender = &user.get_session_data::<Username>().unwrap().0;
-    let recipient = generate_username();
 
     let mut headers = HeaderMap::new();
     let auth_name = "Bearer ".to_owned() + &sender;
@@ -104,21 +168,13 @@ async fn post_message(user: &mut GooseUser) -> TransactionResult {
         .get_request_builder(&GooseMethod::Post, "/message")?
         .headers(headers);
 
-    let data = json!(
-    {
-        "batch":
-        [
-        {"deviceId": sender,
-        "payload": {"cType":0, "ciphertext": "hello"}},
-        { "deviceId": recipient,
-        "payload": {"cType":0, "ciphertext": "goodbye"}},
-        ]
-    });
+    let friends = generate_friends(FRIENDS.unwrap().len() - 1);
+    let msg = json!(construct_message(sender.to_owned(), friends));
 
     let goose_request = GooseRequest::builder()
         .method(GooseMethod::Post)
         .path("/message")
-        .set_request_builder(request_builder.json(&data))
+        .set_request_builder(request_builder.json(&msg))
         .build();
 
     let _goose_metrics = user.request(goose_request).await;
