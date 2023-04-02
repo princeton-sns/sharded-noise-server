@@ -241,7 +241,7 @@ pub mod inbox {
     pub struct InboxActor {
         _id: u16,
         queue: LinkedList<Event>,
-        epoch: Option<u64>,
+        pub epoch: Option<u64>,
         router: Addr<RouterActor>,
         state: Option<Arc<crate::AppState>>,
     }
@@ -447,7 +447,6 @@ pub mod outbox {
             }
 
             self.next_epoch = epoch_id + 1;
-
             self.sequencer
                 .do_send(crate::sequencer::EndEpoch(epoch_id, self.id));
         }
@@ -516,7 +515,6 @@ pub mod sequencer {
             // }
 
             self.epoch += 1;
-            println!("Starting epoch {:?}", self.epoch);
             for inbox_actor in self.state.as_ref().unwrap().inbox_actors.iter() {
                 inbox_actor.do_send(crate::inbox::EpochStart(self.epoch));
             }
@@ -539,13 +537,12 @@ pub mod sequencer {
 
                 let num_outboxes = self.state.as_ref().unwrap().outbox_actors.len();
                 if self.outbox_signals.len() == num_outboxes {
-                    println!("ending epoch: {:?}", self.epoch);
                     self.epoch += 1;
-                    println!("starting epoch: {:?}", self.epoch);
                     self.outbox_signals = Vec::new();
                     for inbox in self.state.as_ref().unwrap().inbox_actors.iter() {
                         inbox.do_send(crate::inbox::EpochStart(self.epoch));
                     }
+                    println!("End epoch: {:?}", self.epoch);
                 }
             }
         }

@@ -1,0 +1,15 @@
+---
+
+concurrency: 10
+base: 'http://localhost:8081'
+iterations: 100
+rampup: 2
+
+plan:
+  - name: Post message
+    request:
+      method: POST
+      headers:
+        Authorization: "Bearer a"
+      body:  '[{"deviceId": "b", "payload": { "cType": 0, "ciphertext": "hello"}}]'
+      url: /message
