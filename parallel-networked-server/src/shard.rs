@@ -882,14 +882,14 @@ async fn index() -> impl Responder {
 }
 
 #[get("/shard")]
-async fn outbox_address(
+async fn outbox_shard(
     state: web::Data<ShardState>,
     auth: web::Header<BearerToken>,
 ) -> impl Responder {
-    
+
     let device_id = auth.into_inner().into_token();
     let bucket = hash_into_bucket(&device_id, state.intershard_router_actors.len(), true);
-    
+
     web::Json::<String>(state.shard_map[bucket].clone())
 }
 
@@ -1208,6 +1208,7 @@ pub async fn init(
             .service(delete_messages)
             .service(clear_messages)
             .service(stream_messages)
+	    .service(outbox_shard)
             // Sequencer API
             .service(start_epoch)
             .service(index)
