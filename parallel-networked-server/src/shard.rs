@@ -881,6 +881,18 @@ async fn index() -> impl Responder {
     HttpResponse::NoContent().finish()
 }
 
+#[get("/shard")]
+async fn outbox_address(
+    state: web::Data<ShardState>,
+    auth: web::Header<BearerToken>,
+) -> impl Responder {
+    
+    let device_id = auth.into_inner().into_token();
+    let bucket = hash_into_bucket(&device_id, state.intershard_router_actors.len(), true);
+    
+    web::Json::<String>(state.shard_map[bucket].clone())
+}
+
 #[post("/message")]
 async fn handle_message(
     bundle: web::Json<client_protocol::Bundle>,
@@ -1202,4 +1214,4 @@ pub async fn init(
             // Intershard API
             .service(intershard_batch);
     })
-}
+    }
