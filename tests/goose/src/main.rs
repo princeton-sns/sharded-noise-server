@@ -10,6 +10,8 @@ use rand::seq::SliceRandom;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::borrow::{Borrow, Cow};
+use std::collections::HashMap;
 
 // static LETTERS: [&str; 26] = [
 //     "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s",
@@ -19,7 +21,9 @@ use serde_json::{json, Value};
 
 // Horribly unsafe AND unsound, never do this, this WILL break, it's terrible.
 static mut USERNAMES: Option<Vec<String>> = None;
-static mut FRIENDS: Option<Vec<String>> = None;
+// static mut FRIENDS: Option<Vec<String>> = None;
+
+static mut COMMON_PAYLOADS: Option<HashMap<String, Bundle>> = None;
 
 #[tokio::main]
 async fn main() -> Result<(), GooseError> {
@@ -29,15 +33,25 @@ async fn main() -> Result<(), GooseError> {
         .find(|(var, _)| var == "NOISE_USERS")
         .map(|(_, val)| val)
         .unwrap();
-    let usernames = usernames_str.split(":").map(|s| s.to_string()).collect();
-    unsafe { USERNAMES = Some(usernames) };
+    let usernames: Vec<String> = usernames_str.split(":").map(|s| s.to_string()).collect();
+    unsafe { USERNAMES = Some(usernames.clone()) };
 
     let friends_str = std::env::vars()
-        .find(|(var, _)| var == "FRIENDS")
+        .find(|(var, _)| var == "NOISE_FRIENDS")
         .map(|(_, val)| val)
-        .unwrap();
-    let friends: Vec<String> = friends_str.split(":").map(|s| s.to_string()).collect();
-    unsafe { FRIENDS = Some(friends) }
+        .unwrap_or_else(|| "".to_string());
+
+    if friends_str != "" {
+        println!("Running with a single payload per sender name!");
+        let friends: Vec<String> = friends_str.split(":").map(|s| s.to_string()).collect();
+        let common_payloads: HashMap<String, Bundle> = usernames
+            .into_iter()
+            .map(|sender| (sender.clone(), construct_message(&sender, friends.iter())))
+            .collect();
+        unsafe { COMMON_PAYLOADS = Some(common_payloads) };
+    } else {
+        println!("Running with individual payloads!");
+    }
 
     g.register_scenario(
         scenario!("PostToOneUserAndSelf")
@@ -117,41 +131,35 @@ async fn set_username(user: &mut GooseUser) -> TransactionResult {
 }
 
 //can optimize if the same for everyone
-fn construct_message(sender: String, friends: Vec<String>) -> Bundle {
+fn construct_message<S: AsRef<str>>(sender: &str, friends: impl Iterator<Item = S>) -> Bundle {
     let payload = Payload {
         c_type: 0,
         ciphertext: "hello world".to_string(),
     };
 
-    let mut batch = Vec::new();
-
-    batch.push(Message {
-        device_id: sender,
-        payload: payload.clone(),
-    });
-    for f in friends {
-        batch.push(Message {
-            device_id: f,
+    let batch: Vec<Message> = friends
+        .map(|f| Message {
+            device_id: f.as_ref().to_string(),
             payload: payload.clone(),
         })
-    }
+        .collect();
 
     return Bundle { batch };
 }
 
-fn generate_friends(num_friends: usize) -> Vec<String> {
-    let mut friends = Vec::new();
+// fn generate_friends(num_friends: usize) -> Vec<String> {
+//     let mut friends = Vec::new();
 
-    for i in 0..num_friends {
-        friends.push(
-            unsafe { FRIENDS.as_ref().unwrap() }
-                .choose(&mut rand::thread_rng())
-                .unwrap()
-                .clone(),
-        )
-    }
-    return friends;
-}
+//     for i in 0..num_friends {
+//         friends.push(
+//             unsafe { FRIENDS.as_ref().unwrap() }
+//                 .choose(&mut rand::thread_rng())
+//                 .unwrap()
+//                 .clone(),
+//         )
+//     }
+//     return friends;
+// }
 
 async fn post_message(user: &mut GooseUser) -> TransactionResult {
     let sender = &user.get_session_data::<Username>().unwrap().0;
@@ -168,13 +176,20 @@ async fn post_message(user: &mut GooseUser) -> TransactionResult {
         .get_request_builder(&GooseMethod::Post, "/message")?
         .headers(headers);
 
-    let friends = generate_friends(FRIENDS.unwrap().len() - 1);
-    let msg = json!(construct_message(sender.to_owned(), friends));
+    let msg: Cow<'static, Bundle> = unsafe {
+        COMMON_PAYLOADS
+            .as_ref()
+            .map(|sender_map| Cow::Borrowed(sender_map.get(sender).unwrap()))
+            .unwrap_or_else(|| Cow::Owned(construct_message(sender, [sender].into_iter())))
+    };
+
+    // let friends = generate_friends(FRIENDS.unwrap().len() - 1);
+    // let msg = json!(construct_message(sender.to_owned(), friends));
 
     let goose_request = GooseRequest::builder()
         .method(GooseMethod::Post)
         .path("/message")
-        .set_request_builder(request_builder.json(&msg))
+        .set_request_builder(request_builder.json(Borrow::<Bundle>::borrow(&msg)))
         .build();
 
     let _goose_metrics = user.request(goose_request).await;
