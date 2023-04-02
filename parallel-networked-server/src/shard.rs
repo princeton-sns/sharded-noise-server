@@ -387,15 +387,17 @@ pub mod intershard {
                     let (src_shard_id, dst_shard_id) = (self.src_shard_id, self.dst_shard_id);
                     let httpc = self.state.as_ref().unwrap().httpc.clone();
 
+                    let payload = bincode::serialize(&IntershardRoutedEpochBatch {
+                        src_shard_id: src_shard_id,
+                        dst_shard_id: dst_shard_id,
+                        epoch_id: epoch_id,
+                        messages: shard_batch,
+                    })
+                    .unwrap();
                     Box::pin(async move {
                         let resp = httpc
                             .post(format!("{}/intershard-batch", dst_shard_url))
-                            .json(&IntershardRoutedEpochBatch {
-                                src_shard_id: src_shard_id,
-                                dst_shard_id: dst_shard_id,
-                                epoch_id: epoch_id,
-                                messages: shard_batch,
-                            })
+                            .body(payload)
                             .send()
                             .await
                             .unwrap();
@@ -1043,9 +1045,12 @@ async fn start_epoch(state: web::Data<ShardState>, epoch_id: web::Path<u64>) -> 
 #[post("/intershard-batch")]
 async fn intershard_batch(
     state: web::Data<ShardState>,
-    batch: web::Json<intershard::IntershardRoutedEpochBatch>,
+    body: web::Bytes,
+    // batch: web::Json<intershard::IntershardRoutedEpochBatch>,
 ) -> impl Responder {
-    intershard::distribute_intershard_batch(&*state, batch.into_inner());
+    use web::Buf;
+    let batch = bincode::deserialize_from(body.reader()).unwrap();
+    intershard::distribute_intershard_batch(&*state, batch);
     ""
 }
 
