@@ -5,21 +5,31 @@
  * - make username generation based on number of users
  */
 use goose::prelude::*;
+use goose_eggs::{validate_and_load_static_assets, Validate};
 use rand::seq::SliceRandom;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Serialize;
 use serde_json::json;
-use goose_eggs::{validate_and_load_static_assets, Validate};
 
-static LETTERS: [&str; 26] = [
-    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s",
-    "t", "u", "v", "w", "x", "y", "z",
-];
-static NUMBERS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+// static LETTERS: [&str; 26] = [
+//     "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s",
+//     "t", "u", "v", "w", "x", "y", "z",
+// ];
+// static NUMBERS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
+// Horribly unsafe AND unsound, never do this, this WILL break, it's terrible.
+static mut USERNAMES: Option<Vec<String>> = None;
 
 #[tokio::main]
 async fn main() -> Result<(), GooseError> {
     let g = GooseAttack::initialize()?;
+
+    let usernames_str = std::env::vars()
+        .find(|(var, _)| var == "NOISE_USERS")
+        .map(|(_, val)| val)
+        .unwrap();
+    let usernames = usernames_str.split(":").map(|s| s.to_string()).collect();
+    unsafe { USERNAMES = Some(usernames) };
 
     g.register_scenario(
         scenario!("PostToOneUserAndSelf")
@@ -33,8 +43,8 @@ async fn main() -> Result<(), GooseError> {
     )
     .register_scenario(
         scenario!("GetOneMailbox")
-        .register_transaction(transaction!(set_username).set_name("generate username"))
-        .register_transaction(transaction!(get_mailbox).set_name("get mailbox"))
+            .register_transaction(transaction!(set_username).set_name("generate username"))
+            .register_transaction(transaction!(get_mailbox).set_name("get mailbox")),
     )
     .register_scenario(
         scenario!("DeletePostGetDelete")
@@ -47,7 +57,7 @@ async fn main() -> Result<(), GooseError> {
     .register_scenario(
         scenario!("ValidateGetMessageAfterPost")
             .register_transaction(transaction!(set_username).set_name("generate username"))
-            .register_transaction(transaction!(loop_message).set_name("loop message"))
+            .register_transaction(transaction!(loop_message).set_name("loop message")),
     )
     .execute()
     .await?;
@@ -58,11 +68,18 @@ async fn main() -> Result<(), GooseError> {
 #[derive(Serialize)]
 struct Username(String);
 
-fn generate_username() -> String {
-    let Some(letter) = LETTERS.choose(&mut rand::thread_rng()) else {todo!()};
-    let Some(number) = NUMBERS.choose(&mut rand::thread_rng()) else {todo!()};
+// fn generate_username() -> String {
+//     let Some(letter) = LETTERS.choose(&mut rand::thread_rng()) else {todo!()};
+//     let Some(number) = NUMBERS.choose(&mut rand::thread_rng()) else {todo!()};
+//
+//     letter.to_string() + &number.to_string()
+// }
 
-    letter.to_string() + &number.to_string()
+fn generate_username() -> String {
+    (unsafe { USERNAMES.as_ref().unwrap() })
+        .choose(&mut rand::thread_rng())
+        .unwrap()
+        .clone()
 }
 
 async fn set_username(user: &mut GooseUser) -> TransactionResult {
@@ -154,7 +171,6 @@ async fn delete_mailbox(user: &mut GooseUser) -> TransactionResult {
 }
 
 async fn loop_message(user: &mut GooseUser) -> TransactionResult {
-
     // SEND MESSAGE TO SELF
     let sender = &user.get_session_data::<Username>().unwrap().0;
 
@@ -187,7 +203,6 @@ async fn loop_message(user: &mut GooseUser) -> TransactionResult {
 
     let _goose_metrics = user.request(post_request).await;
 
-    
     //// GET MESSAGE BACK
     let get_request_builder = user
         .get_request_builder(&GooseMethod::Get, "/outbox")?
@@ -202,12 +217,11 @@ async fn loop_message(user: &mut GooseUser) -> TransactionResult {
     let resp = user.request(get_request).await?;
 
     let validate = &Validate::builder()
-    .status(200)
-    .text("Text to Validate")
-    .build();
+        .status(200)
+        .text("Text to Validate")
+        .build();
 
     validate_and_load_static_assets(user, resp, &validate).await?;
 
     Ok(())
-
 }
