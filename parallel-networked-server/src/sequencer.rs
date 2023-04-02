@@ -5,6 +5,8 @@ use actix_web::{get, post, web, HttpResponse, Responder};
 use serde::{Deserialize, Serialize};
 use serde_json;
 
+const ACTOR_MAILBOX_CAP: usize = 1024;
+
 #[derive(Message, Serialize, Deserialize, Clone, Debug)]
 #[rtype(result = "SequencerRegisterResp")]
 pub struct SequencerRegisterReq {
@@ -97,6 +99,10 @@ impl SequencerActor {
 
 impl Actor for SequencerActor {
     type Context = Context<Self>;
+
+    fn started(&mut self, ctx: &mut Self::Context) {
+        ctx.set_mailbox_capacity(ACTOR_MAILBOX_CAP);
+    }
 }
 
 impl Handler<SequencerRegisterReq> for SequencerActor {

@@ -5,6 +5,8 @@ use actix_web::{
 
 use tokio::time::{sleep, Duration};
 
+const ACTOR_MAILBOX_CAP: usize = 1024;
+
 pub mod client_protocol {
     use serde::{Deserialize, Serialize};
 
@@ -110,6 +112,10 @@ pub mod inbox {
 
     impl Actor for RouterActor {
         type Context = Context<Self>;
+
+        fn started(&mut self, ctx: &mut Self::Context) {
+            ctx.set_mailbox_capacity(super::ACTOR_MAILBOX_CAP);
+        }
     }
 
     impl Handler<InboxEpoch> for RouterActor {
@@ -207,6 +213,10 @@ pub mod inbox {
 
     impl Actor for InboxActor {
         type Context = Context<Self>;
+
+        fn started(&mut self, ctx: &mut Self::Context) {
+            ctx.set_mailbox_capacity(super::ACTOR_MAILBOX_CAP);
+        }
     }
 
     impl Handler<Initialize> for InboxActor {
@@ -312,6 +322,10 @@ pub mod intershard {
 
     impl Actor for InterShardRouterActor {
         type Context = Context<Self>;
+
+        fn started(&mut self, ctx: &mut Self::Context) {
+            ctx.set_mailbox_capacity(super::ACTOR_MAILBOX_CAP);
+        }
     }
 
     impl Handler<Initialize> for InterShardRouterActor {
@@ -448,6 +462,10 @@ pub mod intershard {
 
     impl Actor for EpochCollectorActor {
         type Context = Context<Self>;
+
+        fn started(&mut self, ctx: &mut Self::Context) {
+            ctx.set_mailbox_capacity(super::ACTOR_MAILBOX_CAP);
+        }
     }
 
     impl Handler<Initialize> for EpochCollectorActor {
@@ -550,6 +568,10 @@ pub mod outbox {
 
     impl Actor for ReceiverActor {
         type Context = Context<Self>;
+
+        fn started(&mut self, ctx: &mut Self::Context) {
+            ctx.set_mailbox_capacity(super::ACTOR_MAILBOX_CAP);
+        }
     }
 
     impl Handler<Initialize> for ReceiverActor {
@@ -652,6 +674,10 @@ pub mod outbox {
 
     impl Actor for OutboxActor {
         type Context = Context<Self>;
+
+        fn started(&mut self, ctx: &mut Self::Context) {
+            ctx.set_mailbox_capacity(super::ACTOR_MAILBOX_CAP);
+        }
     }
 
     #[derive(Message, Clone, Debug)]
@@ -886,7 +912,6 @@ async fn outbox_shard(
     state: web::Data<ShardState>,
     auth: web::Header<BearerToken>,
 ) -> impl Responder {
-
     let device_id = auth.into_inner().into_token();
     let bucket = hash_into_bucket(&device_id, state.intershard_router_actors.len(), true);
 
@@ -992,7 +1017,7 @@ async fn retrieve_messages(
 async fn start_epoch(state: web::Data<ShardState>, epoch_id: web::Path<u64>) -> impl Responder {
     // println!("Received start_epoch request: {}", *epoch_id);
     for inbox in state.inbox_actors.iter() {
-        inbox.do_send(inbox::EpochStart(*epoch_id));
+        inbox.send(inbox::EpochStart(*epoch_id)).await.unwrap();
     }
     ""
 }
@@ -1208,11 +1233,11 @@ pub async fn init(
             .service(delete_messages)
             .service(clear_messages)
             .service(stream_messages)
-	    .service(outbox_shard)
+            .service(outbox_shard)
             // Sequencer API
             .service(start_epoch)
             .service(index)
             // Intershard API
             .service(intershard_batch);
     })
-    }
+}
