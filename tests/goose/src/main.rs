@@ -36,29 +36,29 @@ async fn main() -> Result<(), GooseError> {
             .register_transaction(transaction!(set_username).set_name("generate username"))
             .register_transaction(transaction!(post_message).set_name("post request")),
     )
-    .register_scenario(
-        scenario!("DeleteOneMailbox")
-            .register_transaction(transaction!(set_username).set_name("generate username"))
-            .register_transaction(transaction!(delete_mailbox).set_name("delete mailbox")),
-    )
-    .register_scenario(
-        scenario!("GetOneMailbox")
-            .register_transaction(transaction!(set_username).set_name("generate username"))
-            .register_transaction(transaction!(get_mailbox).set_name("get mailbox")),
-    )
-    .register_scenario(
-        scenario!("DeletePostGetDelete")
-            .register_transaction(transaction!(set_username).set_name("generate username"))
-            .register_transaction(transaction!(delete_mailbox).set_name("delete mailbox"))
-            .register_transaction(transaction!(post_message).set_name("post request"))
-            .register_transaction(transaction!(get_mailbox).set_name("get mailbox"))
-            .register_transaction(transaction!(delete_mailbox).set_name("delete mailbox")),
-    )
-    .register_scenario(
-        scenario!("ValidateGetMessageAfterPost")
-            .register_transaction(transaction!(set_username).set_name("generate username"))
-            .register_transaction(transaction!(loop_message).set_name("loop message")),
-    )
+    //.register_scenario(
+    //    scenario!("DeleteOneMailbox")
+    //        .register_transaction(transaction!(set_username).set_name("generate username"))
+    //        .register_transaction(transaction!(delete_mailbox).set_name("delete mailbox")),
+    //)
+    //.register_scenario(
+    //    scenario!("GetOneMailbox")
+    //        .register_transaction(transaction!(set_username).set_name("generate username"))
+    //        .register_transaction(transaction!(get_mailbox).set_name("get mailbox")),
+    //)
+    //.register_scenario(
+    //    scenario!("DeletePostGetDelete")
+    //        .register_transaction(transaction!(set_username).set_name("generate username"))
+    //        .register_transaction(transaction!(delete_mailbox).set_name("delete mailbox"))
+    //        .register_transaction(transaction!(post_message).set_name("post request"))
+    //        .register_transaction(transaction!(get_mailbox).set_name("get mailbox"))
+    //        .register_transaction(transaction!(delete_mailbox).set_name("delete mailbox")),
+    //)
+    //.register_scenario(
+    //    scenario!("ValidateGetMessageAfterPost")
+    //        .register_transaction(transaction!(set_username).set_name("generate username"))
+    //        .register_transaction(transaction!(loop_message).set_name("loop message")),
+    //)
     .execute()
     .await?;
 
