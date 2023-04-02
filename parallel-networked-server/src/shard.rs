@@ -933,7 +933,7 @@ async fn outbox_idx(
     let device_id = auth.into_inner().into_token();
     let bucket = hash_into_bucket(&device_id, state.intershard_router_actors.len(), false);
 
-    web::Json::<String>(state.shard_map[bucket].clone())
+    web::Json::<usize>(bucket)
 }
 
 #[post("/message")]
