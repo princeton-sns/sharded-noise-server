@@ -931,7 +931,7 @@ async fn outbox_idx(
     auth: web::Header<BearerToken>,
 ) -> impl Responder {
     let device_id = auth.into_inner().into_token();
-    let bucket = hash_into_bucket(&device_id, state.intershard_router_actors.len(), false);
+    let bucket = hash_into_bucket(&device_id, state.outbox_actors.len(), false);
 
     web::Json::<usize>(bucket)
 }
