@@ -388,7 +388,7 @@ pub mod intershard {
                     let httpc = self.state.as_ref().unwrap().httpc.clone();
 
                     Box::pin(async move {
-                        httpc
+                        let resp = httpc
                             .post(format!("{}/intershard-batch", dst_shard_url))
                             .json(&IntershardRoutedEpochBatch {
                                 src_shard_id: src_shard_id,
@@ -399,6 +399,10 @@ pub mod intershard {
                             .send()
                             .await
                             .unwrap();
+
+                        if !resp.status().is_success() {
+                            panic!("Received non-success on /intershard-batch: {:?}", resp);
+                        }
                     })
                 }
             } else {
@@ -515,7 +519,7 @@ pub mod intershard {
 
                 Box::pin(async move {
                     // println!("Finishing epoch {}", epoch);
-                    httpc
+                    let resp = httpc
                         .post(format!("{}/end-epoch", seq_url))
                         .json(&crate::sequencer::EndEpochReq {
                             shard_id: self_shard_id,
@@ -525,6 +529,9 @@ pub mod intershard {
                         .send()
                         .await
                         .unwrap();
+                    if !resp.status().is_success() {
+                        panic!("Received non-success on /end-epoch: {:?}", resp);
+                    }
                 })
             } else {
                 Box::pin(async move {})
@@ -1227,6 +1234,8 @@ pub async fn init(
     Box::new(move |service_config: &mut web::ServiceConfig| {
         service_config
             .app_data(state.clone())
+            .app_data(web::PayloadConfig::new(usize::MAX))
+            .app_data(web::JsonConfig::default().limit(usize::MAX))
             // Client API
             .service(handle_message)
             .service(retrieve_messages)
