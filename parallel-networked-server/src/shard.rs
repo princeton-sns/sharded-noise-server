@@ -12,7 +12,7 @@ const ACTOR_MAILBOX_CAP: usize = 1024;
 pub mod client_protocol {
     use serde::{Deserialize, Serialize};
     use std::borrow::Cow;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     // -------------------------------------------------------------------------
     // HTTP API Types
@@ -30,12 +30,13 @@ pub mod client_protocol {
     #[derive(Debug, Serialize, Deserialize, Clone)]
     pub struct EncryptedOutboxMessage {
         pub enc_common: EncryptedCommonPayload,
-        pub enc_recipients: HashMap<String, EncryptedPerRecipientPayload>,
+        pub enc_recipients: BTreeMap<String, EncryptedPerRecipientPayload>,
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
     pub struct EncryptedInboxMessage {
         pub sender: String,
+        // Must be sorted in key order
         pub recipients: Vec<String>,
         pub enc_common: EncryptedCommonPayload,
         pub enc_recipient: EncryptedPerRecipientPayload,
@@ -49,6 +50,7 @@ pub mod client_protocol {
     pub struct EpochMessageBatch<'a> {
         pub epoch_id: u64,
         pub messages: Cow<'a, Vec<EncryptedInboxMessage>>,
+        pub attestation: String,
     }
 
     #[derive(Serialize, Clone, Debug)]
@@ -56,6 +58,73 @@ pub mod client_protocol {
     pub struct OtkeyRequest {
         pub device_id: String,
         pub needs: usize,
+    }
+
+    // -------------------------------------------------------------------------
+    // Attestation payload layout
+
+    #[derive(Clone, Debug)]
+    // Format:
+    // - u64: first_epoch
+    // - u64: next_epoch
+    // - [u8; 32]: messages_digest
+    pub struct AttestationData([u8; 48]);
+
+    impl AttestationData {
+        pub fn from_inbox_epochs<'a>(
+            first_epoch: u64,
+            next_epoch: u64,
+            messages: impl Iterator<Item = &'a EncryptedInboxMessage>,
+        ) -> AttestationData {
+            use sha2::{Digest, Sha256};
+
+            let mut message_hasher = Sha256::new();
+            let mut attestation_messages_hasher = Sha256::new();
+
+            for message in messages {
+                for r in message.recipients.iter() {
+                    message_hasher.update(r.as_bytes());
+                    message_hasher.update(b";");
+                }
+                let mut recipients_digest = [0; 32];
+                message_hasher.finalize_into_reset((&mut recipients_digest).into());
+                attestation_messages_hasher.update(&recipients_digest);
+
+                let mut payload_digest = [0; 32];
+                message_hasher.update(message.enc_common.0.as_bytes());
+                message_hasher.finalize_into_reset((&mut payload_digest).into());
+                attestation_messages_hasher.update(&recipients_digest);
+            }
+
+            let mut attestation_messages_hash = [0; 32];
+            attestation_messages_hasher.finalize_into((&mut attestation_messages_hash).into());
+
+            let mut attestation_data = [0; 48];
+            attestation_data[0..8].copy_from_slice(&u64::to_le_bytes(first_epoch));
+            attestation_data[8..16].copy_from_slice(&u64::to_le_bytes(next_epoch));
+            attestation_data[16..].copy_from_slice(&attestation_messages_hash);
+            AttestationData(attestation_data)
+        }
+
+        pub fn attest(&self, attestation_key: &ed25519_dalek::Keypair) -> Attestation {
+            use ed25519_dalek::Signer;
+            let signature = attestation_key.sign(&self.0);
+
+            let mut attestation = [0; 48 + 64];
+            attestation[0..48].copy_from_slice(&self.0);
+            attestation[48..].copy_from_slice(&signature.to_bytes());
+            Attestation(attestation)
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct Attestation([u8; 48 + 64]);
+
+    impl Attestation {
+        pub fn encode_base64(&self) -> String {
+            use base64::{engine::general_purpose, Engine as _};
+            general_purpose::STANDARD_NO_PAD.encode(&self.0)
+        }
     }
 }
 
@@ -159,6 +228,8 @@ pub mod outbox {
             intershard.iter_mut().for_each(|v| v.reserve(queue_length));
 
             for (idx, ev) in queue.into_iter().enumerate() {
+                // By means of this being a BTreeMap, the recipients
+                // will be sorted in key order
                 let receivers: Vec<_> = ev.message.enc_recipients.keys().cloned().collect();
 
                 let seq = (epoch_id as u128) << 64
@@ -697,7 +768,7 @@ pub mod inbox {
         }
 
         pub fn request_otkeys(&mut self, client_id: String) {
-	    println!("Requesting 20 new otkeys for \"{}\"", client_id);
+            println!("Requesting 20 new otkeys for \"{}\"", client_id);
             if let Some(tx) = self.client_streams.get_mut(&client_id) {
                 tx.try_send(
                     sse::Data::new_json(super::client_protocol::OtkeyRequest {
@@ -818,14 +889,47 @@ pub mod inbox {
             let DeviceEpochBatch(epoch_id, device_messages, message_count) = epoch_batch;
 
             for (device, messages) in device_messages.into_iter() {
-                // Do this before inserting the messages into the
-                // mailbox proper to avoid copying.
+                // Insert the messages into the data structure and immediately get a reference to it:
+                let (prev_epoch, current_epoch_messages_ref) =
+                    if let Some((_, ref mut device_mailbox)) =
+                        self.client_mailboxes.get_mut(&device)
+                    {
+                        device_mailbox.push_back((epoch_id, messages));
+                        (
+                            device_mailbox.iter().nth_back(1).map(|(epoch, _)| epoch),
+                            &device_mailbox.back().unwrap().1,
+                        )
+                    } else {
+                        let mut message_queue = LinkedList::new();
+                        message_queue.push_back((epoch_id, messages));
+                        self.client_mailboxes
+                            .insert(device.clone(), (0, message_queue));
+                        (
+                            None,
+                            &self
+                                .client_mailboxes
+                                .get(&device)
+                                .unwrap()
+                                .1
+                                .back()
+                                .unwrap()
+                                .1,
+                        )
+                    };
+
                 if let Some(tx) = self.client_streams.get_mut(&device) {
                     use std::borrow::Cow;
 
                     let epoch_batch = super::client_protocol::EpochMessageBatch {
                         epoch_id,
-                        messages: Cow::Borrowed(&messages),
+                        messages: Cow::Borrowed(current_epoch_messages_ref),
+                        attestation: super::client_protocol::AttestationData::from_inbox_epochs(
+                            prev_epoch.map(|eid| eid + 1).unwrap_or(0),
+                            epoch_id + 1,
+                            current_epoch_messages_ref.iter(),
+                        )
+                        .attest(&self.state.as_ref().unwrap().attestation_key)
+                        .encode_base64(),
                     };
 
                     tx.try_send(
@@ -839,14 +943,6 @@ pub mod inbox {
                         "Sent epoch batch SSE for client {} and epoch {}",
                         &device, epoch_id
                     );
-                }
-
-                if let Some((_, ref mut device_mailbox)) = self.client_mailboxes.get_mut(&device) {
-                    device_mailbox.push_back((epoch_id, messages));
-                } else {
-                    let mut message_queue = LinkedList::new();
-                    message_queue.push_back((epoch_id, messages));
-                    self.client_mailboxes.insert(device, (0, message_queue));
                 }
             }
 
@@ -1167,7 +1263,11 @@ async fn add_otkeys(
     auth: web::Header<BearerToken>,
     keys: web::Json<HashMap<String, String>>,
 ) -> impl Responder {
-    println!("Add otkeys request for {:?} ({} keys)", auth.token(), keys.len());
+    println!(
+        "Add otkeys request for {:?} ({} keys)",
+        auth.token(),
+        keys.len()
+    );
 
     let device_id = auth.into_inner().into_token();
     let inbox_actors_cnt = state.inbox_actors.len();
@@ -1229,7 +1329,7 @@ async fn get_otkey(
             resp_map.insert("otkey".to_string(), v);
             HttpResponse::Ok().json(GetOtkeyRequestResponse(resp_map))
         } else {
-	    println!("Did not have the requested otkey");
+            println!("Did not have the requested otkey");
             HttpResponse::NotFound().finish()
         }
     }
@@ -1244,6 +1344,7 @@ pub struct ShardState {
     intershard_router_actors: Vec<Addr<intershard::InterShardRouterActor>>,
     inbox_actors: Vec<(Addr<inbox::ReceiverActor>, Addr<inbox::InboxActor>)>,
     epoch_collector_actor: Addr<intershard::EpochCollectorActor>,
+    attestation_key: ed25519_dalek::Keypair,
 }
 
 pub async fn init(
@@ -1252,9 +1353,33 @@ pub async fn init(
     outbox_count: u8,
     inbox_count: u8,
 ) -> impl Fn(&mut web::ServiceConfig) + Clone + Send + 'static {
-    use std::fs;
-    use std::io::{self, Write};
+    use ed25519_dalek::Keypair;
+    use rand::rngs::OsRng;
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{self, Read, Write};
+    use std::mem;
+    use std::path::Path;
     use tokio::sync::mpsc;
+
+    // Read server attestation private key or generate a new one
+    let keypair_path = Path::new("./attestation-key");
+    let keypair = if let Ok(mut keypair_file) = File::open(keypair_path) {
+        let mut keypair_bytes = [0; 64];
+        assert!(keypair_file.read(&mut keypair_bytes).unwrap() == 64);
+        Keypair::from_bytes(&keypair_bytes).unwrap()
+    } else {
+        let mut csprng = OsRng {};
+        let keypair = Keypair::generate(&mut csprng);
+        let mut keypair_file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(keypair_path)
+            .unwrap();
+        keypair_file.write(&keypair.to_bytes()).unwrap();
+        keypair_file.flush().unwrap();
+        mem::drop(keypair_file);
+        keypair
+    };
 
     fs::create_dir("./persist-outbox").unwrap();
 
@@ -1393,6 +1518,7 @@ pub async fn init(
         intershard_router_actors,
         inbox_actors,
         epoch_collector_actor: epoch_collector_actor.clone(),
+        attestation_key: keypair,
     });
 
     for outbox_actor in state.outbox_actors.iter() {
