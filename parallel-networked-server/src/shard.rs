@@ -19,7 +19,7 @@ pub mod client_protocol {
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
     #[serde(transparent)]
-    pub struct EncryptedCommonPayload(String);
+    pub struct EncryptedCommonPayload(pub String);
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
     pub struct EncryptedPerRecipientPayload {
@@ -121,9 +121,68 @@ pub mod client_protocol {
     pub struct Attestation([u8; 48 + 64]);
 
     impl Attestation {
+        pub fn into_arr(self) -> [u8; 48 + 64] {
+            self.0
+        }
+
+        pub fn from_arr(arr: [u8; 48 + 64]) -> Self {
+            Attestation(arr)
+        }
+
+        pub fn from_bytes(bytes: &[u8]) -> Result<Self, ()> {
+            if bytes.len() != 48 + 64 {
+                Err(())
+            } else {
+                let mut buf = [0; 48 + 64];
+                buf.copy_from_slice(bytes);
+                Ok(Attestation(buf))
+            }
+        }
+
+        pub fn decode_base64(s: &str) -> Result<Self, ()> {
+            use base64::{engine::general_purpose, Engine as _};
+
+            if let Ok(vec) = general_purpose::STANDARD_NO_PAD.decode(s) {
+                if vec.len() != 48 + 64 {
+                    Err(())
+                } else {
+		    let mut buf = [0; 48 + 64];
+		    buf.copy_from_slice(&vec);
+                    Ok(Attestation(buf))
+                }
+            } else {
+                Err(())
+            }
+        }
+
         pub fn encode_base64(&self) -> String {
             use base64::{engine::general_purpose, Engine as _};
             general_purpose::STANDARD_NO_PAD.encode(&self.0)
+        }
+
+        pub fn first_epoch(&self) -> u64 {
+            u64::from_le_bytes([
+                self.0[0], self.0[1], self.0[2], self.0[3], self.0[4], self.0[5], self.0[6],
+                self.0[7],
+            ])
+        }
+
+        pub fn next_epoch(&self) -> u64 {
+            u64::from_le_bytes([
+                self.0[8], self.0[9], self.0[10], self.0[11], self.0[12], self.0[13], self.0[14],
+                self.0[15],
+            ])
+        }
+
+        pub fn verify(
+            &self,
+            data: &AttestationData,
+            public_key: &ed25519_dalek::PublicKey,
+        ) -> bool {
+            use ed25519_dalek::Verifier;
+
+            let signature = ed25519_dalek::Signature::from_bytes(&self.0[48..]).unwrap();
+            data.0 == self.0[0..48] && public_key.verify(&data.0, &signature).is_ok()
         }
     }
 }
@@ -926,7 +985,26 @@ pub mod inbox {
                         attestation: super::client_protocol::AttestationData::from_inbox_epochs(
                             prev_epoch.map(|eid| eid + 1).unwrap_or(0),
                             epoch_id + 1,
-                            current_epoch_messages_ref.iter(),
+			    current_epoch_messages_ref.iter(),
+			    // Primitive test for missing messages in attestation:
+                            // [].iter(),
+			    // Primitive test for spurious message in attestation:
+                            // current_epoch_messages_ref.iter().chain(
+                            //     [super::client_protocol::EncryptedInboxMessage {
+                            //         sender: "foo".to_string(),
+                            //         recipients: vec!["bar".to_string()],
+                            //         enc_common: super::client_protocol::EncryptedCommonPayload(
+                            //             "hello!".to_string(),
+                            //         ),
+                            //         enc_recipient:
+                            //             super::client_protocol::EncryptedPerRecipientPayload {
+                            //                 c_type: 0,
+                            //                 ciphertext: "very secret...".to_string(),
+                            //             },
+                            //         seq_id: 12345,
+                            //     }]
+                            //     .iter(),
+                            // ),
                         )
                         .attest(&self.state.as_ref().unwrap().attestation_key)
                         .encode_base64(),
@@ -1380,6 +1458,12 @@ pub async fn init(
         mem::drop(keypair_file);
         keypair
     };
+
+    {
+        use base64::{engine::general_purpose, Engine as _};
+        let encoded = general_purpose::STANDARD_NO_PAD.encode(&keypair.public.to_bytes());
+        println!("Loaded attestation key, public key: {}", encoded);
+    }
 
     fs::create_dir("./persist-outbox").unwrap();
 
