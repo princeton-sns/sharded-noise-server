@@ -697,6 +697,7 @@ pub mod inbox {
         }
 
         pub fn request_otkeys(&mut self, client_id: String) {
+	    println!("Requesting 20 new otkeys for \"{}\"", client_id);
             if let Some(tx) = self.client_streams.get_mut(&client_id) {
                 tx.try_send(
                     sse::Data::new_json(super::client_protocol::OtkeyRequest {
@@ -1166,7 +1167,7 @@ async fn add_otkeys(
     auth: web::Header<BearerToken>,
     keys: web::Json<HashMap<String, String>>,
 ) -> impl Responder {
-    // println!("Add otkeys request for {:?} {:?}", auth.token(), &keys);
+    println!("Add otkeys request for {:?} ({} keys)", auth.token(), keys.len());
 
     let device_id = auth.into_inner().into_token();
     let inbox_actors_cnt = state.inbox_actors.len();
@@ -1196,7 +1197,7 @@ async fn get_otkey(
     query: web::Query<GetOtkeyRequestParams>,
     req: HttpRequest,
 ) -> impl Responder {
-    // println!("Get otkey request for {:?}", &query.device_id);
+    println!("Get otkey request for {:?}", &query.device_id);
 
     // Check whether we are the right shard for this client_id:
     let shard_bucket =
@@ -1228,6 +1229,7 @@ async fn get_otkey(
             resp_map.insert("otkey".to_string(), v);
             HttpResponse::Ok().json(GetOtkeyRequestResponse(resp_map))
         } else {
+	    println!("Did not have the requested otkey");
             HttpResponse::NotFound().finish()
         }
     }
