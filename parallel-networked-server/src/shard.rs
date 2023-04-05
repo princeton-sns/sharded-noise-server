@@ -1,16 +1,21 @@
 use actix::{Actor, Addr, Arbiter};
 use actix_web::{
-    delete, error, get, http::header, post, web, HttpMessage, HttpResponse, Responder,
+    delete, error, get, http::header, post, web, HttpMessage, HttpRequest, HttpResponse, Responder,
 };
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use tokio::time::{sleep, Duration};
 
 const ACTOR_MAILBOX_CAP: usize = 1024;
 
 pub mod client_protocol {
-    use std::collections::HashMap;
     use serde::{Deserialize, Serialize};
     use std::borrow::Cow;
+    use std::collections::HashMap;
+
+    // -------------------------------------------------------------------------
+    // HTTP API Types
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
     #[serde(transparent)]
@@ -18,29 +23,39 @@ pub mod client_protocol {
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
     pub struct EncryptedPerRecipientPayload {
-	pub c_type: usize,
-	pub ciphertext: String,
+        pub c_type: usize,
+        pub ciphertext: String,
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
     pub struct EncryptedOutboxMessage {
-	pub enc_common: EncryptedCommonPayload,
-	pub enc_recipients: HashMap<String, EncryptedPerRecipientPayload>,
+        pub enc_common: EncryptedCommonPayload,
+        pub enc_recipients: HashMap<String, EncryptedPerRecipientPayload>,
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
     pub struct EncryptedInboxMessage {
-	pub sender: String,
-	pub recipients: Vec<String>,
-	pub enc_common: EncryptedCommonPayload,
-	pub enc_recipient: EncryptedPerRecipientPayload,
-	pub seq_id: u128,
+        pub sender: String,
+        pub recipients: Vec<String>,
+        pub enc_common: EncryptedCommonPayload,
+        pub enc_recipient: EncryptedPerRecipientPayload,
+        pub seq_id: u128,
     }
+
+    // -------------------------------------------------------------------------
+    // EventSource Messages
 
     #[derive(Serialize, Clone, Debug)]
     pub struct EpochMessageBatch<'a> {
-	pub epoch_id: u64,
-	pub messages: Cow<'a, Vec<EncryptedInboxMessage>>,
+        pub epoch_id: u64,
+        pub messages: Cow<'a, Vec<EncryptedInboxMessage>>,
+    }
+
+    #[derive(Serialize, Clone, Debug)]
+    #[serde(rename_all = "camelCase")]
+    pub struct OtkeyRequest {
+        pub device_id: String,
+        pub needs: usize,
     }
 }
 
@@ -144,39 +159,28 @@ pub mod outbox {
             intershard.iter_mut().for_each(|v| v.reserve(queue_length));
 
             for (idx, ev) in queue.into_iter().enumerate() {
-                let receivers: Vec<_> = ev
-                    .message
-                    .enc_recipients
-                    .keys()
-                    .cloned()
-                    .collect();
+                let receivers: Vec<_> = ev.message.enc_recipients.keys().cloned().collect();
 
-		let seq =
-                    (epoch_id as u128) << 64
-		    | ((idx as u128) & 0x0000FFFFFFFFFFFF)
+                let seq = (epoch_id as u128) << 64
+                    | ((idx as u128) & 0x0000FFFFFFFFFFFF)
                     | ((self.id as u128) << 48)
                     | ((shard_id as u128) << 56);
 
-		bincode::serialize_into(
-                    &mut writer,
-                    &PersistRecord::Message(Cow::Borrowed(&ev)),
-                )
+                bincode::serialize_into(&mut writer, &PersistRecord::Message(Cow::Borrowed(&ev)))
                     .unwrap();
-
 
                 for (recipient, enc_recipient_payload) in ev.message.enc_recipients.into_iter() {
                     let bucket = hash_into_bucket(&recipient, intershard.len(), true);
 
-                    let ibmsg =
-			super::client_protocol::EncryptedInboxMessage {
-                            sender: ev.sender.clone(),
-                            recipients: receivers.clone(),
-			    enc_common: ev.message.enc_common.clone(),
-                            enc_recipient: enc_recipient_payload,
-                            seq_id: seq,
-			};
+                    let ibmsg = super::client_protocol::EncryptedInboxMessage {
+                        sender: ev.sender.clone(),
+                        recipients: receivers.clone(),
+                        enc_common: ev.message.enc_common.clone(),
+                        enc_recipient: enc_recipient_payload,
+                        seq_id: seq,
+                    };
 
-		    intershard[bucket].push((recipient, ibmsg));
+                    intershard[bucket].push((recipient, ibmsg));
                 }
             }
 
@@ -630,7 +634,10 @@ pub mod inbox {
                 for b in input_queues.1.into_iter() {
                     let batch = b.unwrap();
                     for message in batch.messages.into_iter() {
-			output_map.entry(message.0).or_insert_with(|| Vec::with_capacity(epoch_message_count)).push(message.1);
+                        output_map
+                            .entry(message.0)
+                            .or_insert_with(|| Vec::with_capacity(epoch_message_count))
+                            .push(message.1);
                         // // Use this instead of .entry().or_insert_with() to
                         // // avoid unconditionally cloning the device_id string:
                         // if !output_map.contains_key(&message.0) {
@@ -674,6 +681,7 @@ pub mod inbox {
         >,
         state: Option<Arc<super::ShardState>>,
         client_streams: HashMap<String, sse::Sender>,
+        otkeys: HashMap<String, HashMap<String, String>>,
     }
 
     impl InboxActor {
@@ -684,6 +692,21 @@ pub mod inbox {
                 client_mailboxes: HashMap::new(),
                 state: None,
                 client_streams: HashMap::new(),
+                otkeys: HashMap::new(),
+            }
+        }
+
+        pub fn request_otkeys(&mut self, client_id: String) {
+            if let Some(tx) = self.client_streams.get_mut(&client_id) {
+                tx.try_send(
+                    sse::Data::new_json(super::client_protocol::OtkeyRequest {
+                        device_id: client_id,
+                        needs: 20,
+                    })
+                    .unwrap()
+                    .event("otkey"),
+                )
+                .unwrap();
             }
         }
     }
@@ -718,6 +741,55 @@ pub mod inbox {
     #[derive(MessageResponse, Debug)]
     pub struct DeviceMessageStream(pub Sse<ChannelStream>);
 
+    #[derive(Message, Clone, Debug)]
+    #[rtype(result = "()")]
+    pub struct AddOtkeys(pub String, pub HashMap<String, String>);
+
+    #[derive(Message, Clone, Debug)]
+    #[rtype(result = "Otkey")]
+    pub struct GetOtkey(pub String);
+
+    #[derive(MessageResponse, Clone, Debug)]
+    pub struct Otkey(pub Option<(String, String)>);
+
+    impl Handler<AddOtkeys> for InboxActor {
+        type Result = ();
+
+        fn handle(&mut self, msg: AddOtkeys, _ctx: &mut Context<Self>) -> Self::Result {
+            let AddOtkeys(client_id, key_map) = msg;
+
+            self.otkeys
+                .entry(client_id)
+                .or_insert_with(|| HashMap::new())
+                .extend(key_map);
+        }
+    }
+
+    impl Handler<GetOtkey> for InboxActor {
+        type Result = Otkey;
+
+        fn handle(&mut self, msg: GetOtkey, _ctx: &mut Context<Self>) -> Self::Result {
+            let GetOtkey(client_id) = msg;
+
+            let (res, key_map_len) = if let Some(key_map) = self.otkeys.get_mut(&client_id) {
+                if let Some(k) = key_map.keys().next().cloned() {
+                    let v = key_map.remove(&k).unwrap();
+                    (Otkey(Some((k, v))), key_map.len())
+                } else {
+                    (Otkey(None), 0)
+                }
+            } else {
+                (Otkey(None), 0)
+            };
+
+            if key_map_len < 10 {
+                self.request_otkeys(client_id);
+            }
+
+            res
+        }
+    }
+
     // #[derive(Message, Clone, Debug)]
     // #[rtype(result = "DeviceMessages")]
     // pub struct DeleteDeviceMessages(pub String, pub (u64, u64));
@@ -745,18 +817,27 @@ pub mod inbox {
             let DeviceEpochBatch(epoch_id, device_messages, message_count) = epoch_batch;
 
             for (device, messages) in device_messages.into_iter() {
+                // Do this before inserting the messages into the
+                // mailbox proper to avoid copying.
                 if let Some(tx) = self.client_streams.get_mut(&device) {
-		    use std::borrow::Cow;
+                    use std::borrow::Cow;
 
-		    let epoch_batch = super::client_protocol::EpochMessageBatch {
-			epoch_id,
-			messages: Cow::Borrowed(&messages),
-		    };
+                    let epoch_batch = super::client_protocol::EpochMessageBatch {
+                        epoch_id,
+                        messages: Cow::Borrowed(&messages),
+                    };
 
                     tx.try_send(
-			sse::Data::new_json(epoch_batch).unwrap().event("epoch_message_batch")
-		    )
-			.unwrap();
+                        sse::Data::new_json(epoch_batch)
+                            .unwrap()
+                            .event("epoch_message_batch"),
+                    )
+                    .unwrap();
+
+                    println!(
+                        "Sent epoch batch SSE for client {} and epoch {}",
+                        &device, epoch_id
+                    );
                 }
 
                 if let Some((_, ref mut device_mailbox)) = self.client_mailboxes.get_mut(&device) {
@@ -794,7 +875,12 @@ pub mod inbox {
             // client can fetch those messages through a separate endpoint.
 
             let (tx, rx) = sse::channel(128);
-            self.client_streams.insert(client_id, tx);
+            self.client_streams.insert(client_id.clone(), tx);
+
+            // let otkey_count = self.otkeys.get(&client_id).map(|hm| hm.len()).unwrap_or(0);
+            // if otkey_count < 10 {
+            self.request_otkeys(client_id);
+            // }
 
             DeviceMessageStream(rx)
         }
@@ -941,18 +1027,15 @@ async fn inbox_shard(
     let device_id = auth.into_inner().into_token();
     let bucket = hash_into_bucket(&device_id, state.intershard_router_actors.len(), true);
 
-    web::Json::<String>(state.shard_map[bucket].clone())
+    state.shard_map[bucket].clone()
 }
 
 #[get("/inboxidx")]
-async fn inbox_idx(
-    state: web::Data<ShardState>,
-    auth: web::Header<BearerToken>,
-) -> impl Responder {
+async fn inbox_idx(state: web::Data<ShardState>, auth: web::Header<BearerToken>) -> impl Responder {
     let device_id = auth.into_inner().into_token();
     let bucket = hash_into_bucket(&device_id, state.inbox_actors.len(), false);
 
-    web::Json::<usize>(bucket)
+    format!("{}", bucket)
 }
 
 #[post("/message")]
@@ -961,7 +1044,7 @@ async fn handle_message(
     state: web::Data<ShardState>,
     auth: web::Header<BearerToken>,
 ) -> impl Responder {
-    println!("Handling message for {:?}: {:?}", auth.token(), msg);
+    // println!("Handling message for {:?}: {:?}", auth.token(), msg);
 
     let sender_id = auth.into_inner().into_token();
     let outbox_actors_cnt = state.outbox_actors.len();
@@ -985,7 +1068,7 @@ async fn stream_messages(
     state: web::Data<ShardState>,
     auth: web::Header<BearerToken>,
 ) -> impl Responder {
-    println!("Event listener register request for {:?}", auth.token());
+    // println!("Event listener register request for {:?}", auth.token());
 
     let device_id = auth.into_inner().into_token();
     let inbox_actors_cnt = state.inbox_actors.len();
@@ -1042,6 +1125,8 @@ async fn retrieve_messages(
     state: web::Data<ShardState>,
     auth: web::Header<BearerToken>,
 ) -> impl Responder {
+    // println!("Retrieve messages request for {:?}", auth.token());
+
     let device_id = auth.into_inner().into_token();
     let inbox_actors_cnt = state.inbox_actors.len();
     let actor_idx = hash_into_bucket(&device_id, inbox_actors_cnt, false);
@@ -1073,6 +1158,79 @@ async fn intershard_batch(
     let batch = bincode::deserialize_from(body.reader()).unwrap();
     intershard::distribute_intershard_batch(&*state, batch);
     ""
+}
+
+#[post("/self/otkeys")]
+async fn add_otkeys(
+    state: web::Data<ShardState>,
+    auth: web::Header<BearerToken>,
+    keys: web::Json<HashMap<String, String>>,
+) -> impl Responder {
+    // println!("Add otkeys request for {:?} {:?}", auth.token(), &keys);
+
+    let device_id = auth.into_inner().into_token();
+    let inbox_actors_cnt = state.inbox_actors.len();
+    let actor_idx = hash_into_bucket(&device_id, inbox_actors_cnt, false);
+
+    state.inbox_actors[actor_idx]
+        .1
+        .send(inbox::AddOtkeys(device_id, keys.into_inner()))
+        .await
+        .unwrap();
+
+    HttpResponse::NoContent().finish()
+}
+
+#[derive(Deserialize)]
+struct GetOtkeyRequestParams {
+    pub device_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(transparent)]
+struct GetOtkeyRequestResponse(HashMap<String, String>);
+
+#[get("/devices/otkey")]
+async fn get_otkey(
+    state: web::Data<ShardState>,
+    query: web::Query<GetOtkeyRequestParams>,
+    req: HttpRequest,
+) -> impl Responder {
+    // println!("Get otkey request for {:?}", &query.device_id);
+
+    // Check whether we are the right shard for this client_id:
+    let shard_bucket =
+        hash_into_bucket(&query.device_id, state.intershard_router_actors.len(), true);
+    if (state.shard_id as usize) != shard_bucket {
+        HttpResponse::TemporaryRedirect()
+            .append_header((
+                "Location",
+                format!(
+                    "{}{}?{}",
+                    state.shard_map[shard_bucket],
+                    req.path(),
+                    req.query_string()
+                ),
+            ))
+            .finish()
+    } else {
+        let inbox_actors_cnt = state.inbox_actors.len();
+        let actor_idx = hash_into_bucket(&query.device_id, inbox_actors_cnt, false);
+
+        let opt_otkey = state.inbox_actors[actor_idx]
+            .1
+            .send(inbox::GetOtkey(query.into_inner().device_id))
+            .await
+            .unwrap();
+
+        if let Some((_k, v)) = opt_otkey.0 {
+            let mut resp_map = HashMap::new();
+            resp_map.insert("otkey".to_string(), v);
+            HttpResponse::Ok().json(GetOtkeyRequestResponse(resp_map))
+        } else {
+            HttpResponse::NotFound().finish()
+        }
+    }
 }
 
 pub struct ShardState {
@@ -1191,8 +1349,7 @@ pub async fn init(
     }
 
     // Boot up a set of inbox actors on individual arbiters:
-    let mut inbox_actors: Vec<(Addr<inbox::ReceiverActor>, Addr<inbox::InboxActor>)> =
-        Vec::new();
+    let mut inbox_actors: Vec<(Addr<inbox::ReceiverActor>, Addr<inbox::InboxActor>)> = Vec::new();
     for id in 0..inbox_count {
         let (inbox_tx, mut inbox_rx) = mpsc::channel(1);
         let inbox_arbiter = Arbiter::new();
@@ -1281,6 +1438,8 @@ pub async fn init(
             .service(stream_messages)
             .service(inbox_shard)
             .service(inbox_idx)
+            .service(get_otkey)
+            .service(add_otkeys)
             // Sequencer API
             .service(start_epoch)
             .service(index)
