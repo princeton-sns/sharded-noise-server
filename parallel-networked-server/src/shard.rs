@@ -540,10 +540,12 @@ pub mod outbox {
 
             writer.flush().unwrap();
 
-            for (messages, intershard_rt) in intershard
+            for (mut messages, intershard_rt) in intershard
                 .into_iter()
                 .zip(state.intershard_router_actors.iter())
             {
+		messages.shrink_to_fit();
+
                 let routed_batch = RoutedEpochBatch {
                     epoch_id,
                     outbox_id: self.id,
@@ -1090,6 +1092,10 @@ pub mod inbox {
     pub struct GetDeviceMessages(pub String);
 
     #[derive(Message, Clone, Debug)]
+    #[rtype(result = "()")]
+    pub struct ClearAllMessages;
+
+    #[derive(Message, Clone, Debug)]
     #[rtype(result = "DeviceMessageStream")]
     pub struct GetDeviceMessageStream(pub String);
 
@@ -1143,6 +1149,13 @@ pub mod inbox {
 
             res
         }
+    }
+
+    impl Handler<ClearAllMessages> for InboxActor {
+	type Result = ();
+	fn handle(&mut self, _msg: ClearAllMessages, _ctx: &mut Context<Self>) -> Self::Result {
+	    self.client_mailboxes = HashMap::new();
+	}
     }
 
     // #[derive(Message, Clone, Debug)]
@@ -1501,7 +1514,7 @@ async fn stream_messages(
 }
 
 #[delete("/inbox")]
-async fn clear_messages(
+async fn delete_messages(
     state: web::Data<ShardState>,
     auth: web::Header<BearerToken>,
 ) -> impl Responder {
@@ -1516,6 +1529,17 @@ async fn clear_messages(
         .unwrap();
 
     web::Json(messages.0)
+}
+
+#[delete("/inbox/clear-all")]
+async fn clear_all_messages(
+    state: web::Data<ShardState>,
+) -> impl Responder {
+    for (_, ref iba) in state.inbox_actors.iter() {
+	iba.send(inbox::ClearAllMessages).await.unwrap()
+    }
+
+    "".to_string()
 }
 
 // // TODO: find opt param setup and combine with above
@@ -1889,7 +1913,8 @@ pub async fn init(
             .service(handle_message)
             .service(retrieve_messages)
             // .service(delete_messages)
-            .service(clear_messages)
+	    .service(delete_messages)
+            .service(clear_all_messages)
             .service(stream_messages)
             .service(inbox_shard)
             .service(inbox_idx)
