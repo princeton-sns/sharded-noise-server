@@ -1443,24 +1443,42 @@ async fn handle_message(
     msg: web::Json<client_protocol::EncryptedOutboxMessage>,
     state: web::Data<ShardState>,
     auth: web::Header<BearerToken>,
+    req: HttpRequest,
 ) -> impl Responder {
     // println!("Handling message for {:?}: {:?}", auth.token(), msg);
 
-    let sender_id = auth.into_inner().into_token();
-    let outbox_actors_cnt = state.outbox_actors.len();
-    let actor_idx = hash_into_bucket(&sender_id, outbox_actors_cnt, false);
+    // Check whether we are the right shard for this client_id:
+    let shard_bucket =
+        hash_into_bucket(auth.token(), state.intershard_router_actors.len(), true);
+    if (state.shard_id as usize) != shard_bucket {
+        HttpResponse::TemporaryRedirect()
+            .append_header((
+                "Location",
+                format!(
+                    "{}{}?{}",
+                    state.shard_map[shard_bucket],
+                    req.path(),
+                    req.query_string()
+                ),
+            ))
+            .finish()
+    } else {
+	let sender_id = auth.into_inner().into_token();
+	let outbox_actors_cnt = state.outbox_actors.len();
+	let actor_idx = hash_into_bucket(&sender_id, outbox_actors_cnt, false);
 
-    // Now, send the message to the corresponding actor:
-    let epoch = state.outbox_actors[actor_idx]
-        .send(outbox::Event {
-            sender: sender_id,
-            message: msg.into_inner(),
-        })
-        .await
-        .unwrap()
-        .unwrap();
+	// Now, send the message to the corresponding actor:
+	let epoch = state.outbox_actors[actor_idx]
+            .send(outbox::Event {
+		sender: sender_id,
+		message: msg.into_inner(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
 
-    web::Json::<u64>(epoch)
+	HttpResponse::Ok().json(epoch)
+    }
 }
 
 #[get("/events")]

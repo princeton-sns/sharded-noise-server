@@ -12,10 +12,13 @@ use serde::Serialize;
 
 use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // Horribly unsafe AND unsound, never do this, this WILL break, it's terrible.
 static mut USERNAMES: Option<Vec<String>> = None;
 static mut COMMON_PAYLOADS: Option<HashMap<String, EncryptedOutboxMessage>> = None;
+
+static GOOSE_USER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[tokio::main]
 async fn main() -> Result<(), GooseError> {
@@ -59,6 +62,11 @@ async fn main() -> Result<(), GooseError> {
             )
             .register_transaction(transaction!(post_message).set_name("post request")),
     )
+    // This is important to avoid constant redirects and overloading any
+    // single shard. The server will automatically direct individual users
+    // to the right shards given their chosen user id.
+    .set_default(GooseDefault::StickyFollow, true)
+    .unwrap()
     //.register_scenario(
     //    scenario!("DeleteOneMailbox")
     //        .register_transaction(transaction!(set_username).set_name("generate username"))
@@ -103,15 +111,25 @@ pub struct EncryptedOutboxMessage {
     pub enc_recipients: HashMap<String, EncryptedPerRecipientPayload>,
 }
 
-fn choose_username() -> String {
-    (unsafe { USERNAMES.as_ref().unwrap() })
-        .choose(&mut rand::thread_rng())
-        .unwrap()
-        .clone()
-}
-
 async fn set_username(user: &mut GooseUser) -> TransactionResult {
-    user.set_session_data(Username(choose_username()));
+    let deterministic_users = std::env::vars()
+        .find(|(var, _)| var == "DET_USERS")
+        .map(|(_, content)| content != "")
+        .unwrap_or(false);
+
+    let username = if deterministic_users {
+        (unsafe { USERNAMES.as_ref().unwrap() })
+            .get(GOOSE_USER_COUNT.fetch_add(1, Ordering::Relaxed))
+            .unwrap()
+            .clone()
+    } else {
+        (unsafe { USERNAMES.as_ref().unwrap() })
+            .choose(&mut rand::thread_rng())
+            .unwrap()
+            .clone()
+    };
+
+    user.set_session_data(Username(username));
 
     Ok(())
 }
