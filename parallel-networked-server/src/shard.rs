@@ -1443,12 +1443,50 @@ async fn inbox_shard(
     state.shard_map[bucket].clone()
 }
 
+#[derive(Deserialize)]
+struct BatchHashQuery {
+    pub count: usize,
+}
+
+
+#[get("/shard/batch")]
+async fn inbox_shard_batch(
+    state: web::Data<ShardState>,
+    query: web::Query<BatchHashQuery>,
+) -> impl Responder {
+    let mut map = HashMap::new();
+
+    for i in 0..(query.count) {
+	let device_id = format!("{}", i);
+	let bucket = hash_into_bucket(&device_id, state.intershard_router_actors.len(), true);
+	map.insert(device_id, state.shard_map[bucket].clone());
+    }
+
+    web::Json(map)
+}
+
 #[get("/inboxidx")]
 async fn inbox_idx(state: web::Data<ShardState>, auth: web::Header<BearerToken>) -> impl Responder {
     let device_id = auth.into_inner().into_token();
     let bucket = hash_into_bucket(&device_id, state.inbox_actors.len(), false);
 
     format!("{}", bucket)
+}
+
+#[get("/inboxidx/batch")]
+async fn inbox_idx_batch(
+    state: web::Data<ShardState>,
+    query: web::Query<BatchHashQuery>,
+) -> impl Responder {
+    let mut map = HashMap::new();
+
+    for i in 0..(query.count) {
+	let device_id = format!("{}", i);
+	let bucket = hash_into_bucket(&device_id, state.intershard_router_actors.len(), false);
+	map.insert(device_id, state.shard_map[bucket].clone());
+    }
+
+    web::Json(map)
 }
 
 #[post("/message")]
@@ -1918,6 +1956,8 @@ pub async fn init(
             .service(stream_messages)
             .service(inbox_shard)
             .service(inbox_idx)
+	    .service(inbox_shard_batch)
+            .service(inbox_idx_batch)
             .service(get_otkey)
             .service(add_otkeys)
             // Sequencer API
