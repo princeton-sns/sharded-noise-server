@@ -5,25 +5,17 @@
  * - make username generation based on number of users
  */
 use goose::prelude::*;
-use goose_eggs::{validate_and_load_static_assets, Validate};
+
 use rand::seq::SliceRandom;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Serialize;
-use serde_json::{json, Value};
+
 use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
 
-// static LETTERS: [&str; 26] = [
-//     "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s",
-//     "t", "u", "v", "w", "x", "y", "z",
-// ];
-// static NUMBERS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
-
 // Horribly unsafe AND unsound, never do this, this WILL break, it's terrible.
 static mut USERNAMES: Option<Vec<String>> = None;
-// static mut FRIENDS: Option<Vec<String>> = None;
-
-static mut COMMON_PAYLOADS: Option<HashMap<String, Bundle>> = None;
+static mut COMMON_PAYLOADS: Option<HashMap<String, EncryptedOutboxMessage>> = None;
 
 #[tokio::main]
 async fn main() -> Result<(), GooseError> {
@@ -44,9 +36,14 @@ async fn main() -> Result<(), GooseError> {
     if friends_str != "" {
         println!("Running with a single payload per sender name!");
         let friends: Vec<String> = friends_str.split(":").map(|s| s.to_string()).collect();
-        let common_payloads: HashMap<String, Bundle> = usernames
+        let common_payloads: HashMap<String, EncryptedOutboxMessage> = usernames
             .into_iter()
-            .map(|sender| (sender.clone(), construct_message(&sender, friends.iter())))
+            .map(|sender| {
+                (
+                    sender.clone(),
+                    construct_message(&sender, friends.iter().map(|f| Cow::Borrowed(f.as_str()))),
+                )
+            })
             .collect();
         unsafe { COMMON_PAYLOADS = Some(common_payloads) };
     } else {
@@ -55,7 +52,11 @@ async fn main() -> Result<(), GooseError> {
 
     g.register_scenario(
         scenario!("PostToOneUserAndSelf")
-            .register_transaction(transaction!(set_username).set_name("generate username"))
+            .register_transaction(
+                transaction!(set_username)
+                    .set_name("generate username")
+                    .set_on_start(),
+            )
             .register_transaction(transaction!(post_message).set_name("post request")),
     )
     //.register_scenario(
@@ -91,33 +92,18 @@ async fn main() -> Result<(), GooseError> {
 struct Username(String);
 
 #[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct Payload {
+pub struct EncryptedPerRecipientPayload {
     pub c_type: usize,
     pub ciphertext: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct Message {
-    pub device_id: String,
-    pub payload: Payload,
+pub struct EncryptedOutboxMessage {
+    pub enc_common: String,
+    pub enc_recipients: HashMap<String, EncryptedPerRecipientPayload>,
 }
 
-#[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct Bundle {
-    pub batch: Vec<Message>,
-}
-
-// fn generate_username() -> String {
-//     let Some(letter) = LETTERS.choose(&mut rand::thread_rng()) else {todo!()};
-//     let Some(number) = NUMBERS.choose(&mut rand::thread_rng()) else {todo!()};
-//
-//     letter.to_string() + &number.to_string()
-// }
-
-fn generate_username() -> String {
+fn choose_username() -> String {
     (unsafe { USERNAMES.as_ref().unwrap() })
         .choose(&mut rand::thread_rng())
         .unwrap()
@@ -125,41 +111,35 @@ fn generate_username() -> String {
 }
 
 async fn set_username(user: &mut GooseUser) -> TransactionResult {
-    user.set_session_data(Username(generate_username()));
+    user.set_session_data(Username(choose_username()));
 
     Ok(())
 }
 
-//can optimize if the same for everyone
-fn construct_message<S: AsRef<str>>(sender: &str, friends: impl Iterator<Item = S>) -> Bundle {
-    let payload = Payload {
-        c_type: 0,
-        ciphertext: "hello world".to_string(),
-    };
+fn construct_message<'a>(
+    _sender: &str,
+    friends: impl Iterator<Item = Cow<'a, str>>,
+) -> EncryptedOutboxMessage {
+    let common_payload = "Hello World!".to_string();
 
-    let batch: Vec<Message> = friends
-        .map(|f| Message {
-            device_id: f.as_ref().to_string(),
-            payload: payload.clone(),
+    let recipient_payloads: HashMap<String, EncryptedPerRecipientPayload> = friends
+        .map(|f| {
+            let ciphertext = format!("Super secret special message for {}", f);
+            (
+                f.into_owned(),
+                EncryptedPerRecipientPayload {
+                    c_type: 0,
+                    ciphertext,
+                },
+            )
         })
         .collect();
 
-    return Bundle { batch };
+    EncryptedOutboxMessage {
+        enc_common: common_payload,
+        enc_recipients: recipient_payloads,
+    }
 }
-
-// fn generate_friends(num_friends: usize) -> Vec<String> {
-//     let mut friends = Vec::new();
-
-//     for i in 0..num_friends {
-//         friends.push(
-//             unsafe { FRIENDS.as_ref().unwrap() }
-//                 .choose(&mut rand::thread_rng())
-//                 .unwrap()
-//                 .clone(),
-//         )
-//     }
-//     return friends;
-// }
 
 async fn post_message(user: &mut GooseUser) -> TransactionResult {
     let sender = &user.get_session_data::<Username>().unwrap().0;
@@ -176,123 +156,25 @@ async fn post_message(user: &mut GooseUser) -> TransactionResult {
         .get_request_builder(&GooseMethod::Post, "/message")?
         .headers(headers);
 
-    let msg: Cow<'static, Bundle> = unsafe {
+    let msg: Cow<'static, EncryptedOutboxMessage> = unsafe {
         COMMON_PAYLOADS
             .as_ref()
             .map(|sender_map| Cow::Borrowed(sender_map.get(sender).unwrap()))
-            .unwrap_or_else(|| Cow::Owned(construct_message(sender, [sender].into_iter())))
+            .unwrap_or_else(|| {
+                Cow::Owned(construct_message(
+                    sender,
+                    [Cow::Borrowed(sender.as_str())].into_iter(),
+                ))
+            })
     };
 
-    // let friends = generate_friends(FRIENDS.unwrap().len() - 1);
-    // let msg = json!(construct_message(sender.to_owned(), friends));
-
     let goose_request = GooseRequest::builder()
         .method(GooseMethod::Post)
         .path("/message")
-        .set_request_builder(request_builder.json(Borrow::<Bundle>::borrow(&msg)))
+        .set_request_builder(request_builder.json(Borrow::<EncryptedOutboxMessage>::borrow(&msg)))
         .build();
 
     let _goose_metrics = user.request(goose_request).await;
-
-    Ok(())
-}
-
-async fn get_mailbox(user: &mut GooseUser) -> TransactionResult {
-    let username = &user.get_session_data::<Username>().unwrap().0;
-
-    let mut headers = HeaderMap::new();
-    let auth_name = "Bearer ".to_owned() + username.as_str();
-    headers.insert("Authorization", HeaderValue::from_str(&auth_name).unwrap());
-
-    let request_builder = user
-        .get_request_builder(&GooseMethod::Get, "/outbox")?
-        .headers(headers);
-
-    let goose_request = GooseRequest::builder()
-        .method(GooseMethod::Get)
-        .path("/outbox")
-        .set_request_builder(request_builder)
-        .build();
-
-    let _goose_metrics = user.request(goose_request).await;
-
-    Ok(())
-}
-
-async fn delete_mailbox(user: &mut GooseUser) -> TransactionResult {
-    let username = &user.get_session_data::<Username>().unwrap().0;
-
-    let mut headers = HeaderMap::new();
-    let auth_name = "Bearer ".to_owned() + username.as_str();
-    headers.insert("Authorization", HeaderValue::from_str(&auth_name).unwrap());
-
-    let request_builder = user
-        .get_request_builder(&GooseMethod::Delete, "/outbox")?
-        .headers(headers);
-
-    let goose_request = GooseRequest::builder()
-        .method(GooseMethod::Delete)
-        .path("/outbox")
-        .set_request_builder(request_builder)
-        .build();
-
-    let _goose_metrics = user.request(goose_request).await;
-
-    Ok(())
-}
-
-async fn loop_message(user: &mut GooseUser) -> TransactionResult {
-    // SEND MESSAGE TO SELF
-    let sender = &user.get_session_data::<Username>().unwrap().0;
-
-    let mut headers = HeaderMap::new();
-    let auth_name = "Bearer ".to_owned() + &sender;
-    headers.insert("Authorization", HeaderValue::from_str(&auth_name).unwrap());
-    headers.insert(
-        "Content-Type",
-        HeaderValue::from_str("application/json").unwrap(),
-    );
-
-    let post_request_builder = user
-        .get_request_builder(&GooseMethod::Post, "/message")?
-        .headers(headers.clone());
-
-    let data = json!(
-    {
-        "batch":
-        [
-        {"deviceId": sender,
-        "payload": {"cType":0, "ciphertext": "Text to Validate"}},
-        ]
-    });
-
-    let post_request = GooseRequest::builder()
-        .method(GooseMethod::Post)
-        .path("/message")
-        .set_request_builder(post_request_builder.json(&data))
-        .build();
-
-    let _goose_metrics = user.request(post_request).await;
-
-    //// GET MESSAGE BACK
-    let get_request_builder = user
-        .get_request_builder(&GooseMethod::Get, "/outbox")?
-        .headers(headers);
-
-    let get_request = GooseRequest::builder()
-        .method(GooseMethod::Get)
-        .path("/outbox")
-        .set_request_builder(get_request_builder)
-        .build();
-
-    let resp = user.request(get_request).await?;
-
-    let validate = &Validate::builder()
-        .status(200)
-        .text("Text to Validate")
-        .build();
-
-    validate_and_load_static_assets(user, resp, &validate).await?;
 
     Ok(())
 }
