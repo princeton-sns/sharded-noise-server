@@ -37,14 +37,18 @@ async fn main() -> Result<(), GooseError> {
         .unwrap_or_else(|| "".to_string());
 
     if friends_str != "" {
-        println!("Running with a single payload per sender name!");
-        let friends: Vec<String> = friends_str.split(":").map(|s| s.to_string()).collect();
+        println!("Running with individual payloads per sender name!");
+        let sender_friends: Vec<Vec<String>> = friends_str
+            .split(":")
+            .map(|s| s.split(",").map(|s| s.to_string()).collect())
+            .collect();
         let common_payloads: HashMap<String, EncryptedOutboxMessage> = usernames
             .into_iter()
-            .map(|sender| {
+            .zip(sender_friends.into_iter())
+            .map(|(sender, friends)| {
                 (
                     sender.clone(),
-                    construct_message(&sender, friends.iter().map(|f| Cow::Borrowed(f.as_str()))),
+                    construct_message(&sender, friends.into_iter().map(|f| Cow::Owned(f))),
                 )
             })
             .collect();
