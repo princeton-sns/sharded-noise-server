@@ -48,6 +48,13 @@ pub struct ProbeShards;
 #[rtype(result = "()")]
 pub struct EpochStart(u64);
 
+#[derive(Message, Clone, Debug)]
+#[rtype(result = "CurrentEpochResp")]
+pub struct CurrentEpochReq;
+
+#[derive(MessageResponse)]
+pub struct CurrentEpochResp(u64);
+
 #[derive(Serialize)]
 #[serde(tag = "type")]
 pub enum EpochLogEntry {
@@ -191,6 +198,18 @@ impl Handler<EpochStart> for SequencerActor {
     }
 }
 
+impl Handler<CurrentEpochReq> for SequencerActor {
+    type Result = CurrentEpochResp;
+
+    fn handle(&mut self, _msg: CurrentEpochReq, _ctx: &mut Context<Self>) -> Self::Result {
+        CurrentEpochResp(match &self.phase {
+            &Phase::Sequencing(epoch_id, _) => epoch_id,
+            &Phase::Registration => 0,
+            &Phase::Bootup => 0,
+        })
+    }
+}
+
 impl Handler<EndEpochReq> for SequencerActor {
     type Result = ();
 
@@ -279,6 +298,11 @@ async fn end_epoch(
     ""
 }
 
+#[get("/current-epoch")]
+async fn current_epoch(state: web::Data<Addr<SequencerActor>>) -> impl Responder {
+    format!("{}", state.send(CurrentEpochReq).await.unwrap().0)
+}
+
 pub async fn init(num_shards: u8) -> impl Fn(&mut web::ServiceConfig) + Clone + Send + 'static {
     let sequencer_addr = SequencerActor::new(num_shards).start();
 
@@ -287,6 +311,7 @@ pub async fn init(num_shards: u8) -> impl Fn(&mut web::ServiceConfig) + Clone + 
             .app_data(web::Data::new(sequencer_addr.clone()))
             .service(register)
             .service(shard_map)
-            .service(end_epoch);
+            .service(end_epoch)
+            .service(current_epoch);
     })
 }
