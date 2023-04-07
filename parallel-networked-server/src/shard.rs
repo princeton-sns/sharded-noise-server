@@ -910,7 +910,7 @@ pub mod intershard {
 
 pub mod inbox {
     use actix::{Actor, Addr, Context, Handler, Message, MessageResponse};
-    use actix_web_lab::sse::{self, ChannelStream, Sse};
+    use actix_web_lab::sse::{self, ChannelStream, Sse, TrySendError};
     use std::collections::{HashMap, LinkedList};
     use std::mem;
     use std::sync::Arc;
@@ -1055,15 +1055,18 @@ pub mod inbox {
         pub fn request_otkeys(&mut self, client_id: String) {
             println!("Requesting 20 new otkeys for \"{}\"", client_id);
             if let Some(tx) = self.client_streams.get_mut(&client_id) {
-                tx.try_send(
+                let res = tx.try_send(
                     sse::Data::new_json(super::client_protocol::OtkeyRequest {
-                        device_id: client_id,
+                        device_id: client_id.clone(),
                         needs: 20,
                     })
                     .unwrap()
                     .event("otkey"),
-                )
-                .unwrap();
+                );
+
+		if let Err(TrySendError::Full(_)) = res {
+		    panic!("Could not send otkey request to client {}, SSE channel full!", client_id)
+		}
             }
         }
     }
@@ -1248,12 +1251,15 @@ pub mod inbox {
                         .encode_base64(),
                     };
 
-                    tx.try_send(
+                    let res = tx.try_send(
                         sse::Data::new_json(epoch_batch)
                             .unwrap()
                             .event("epoch_message_batch"),
-                    )
-                    .unwrap();
+                    );
+
+		    if let Err(TrySendError::Full(_)) = res {
+			panic!("Could not send message to client {}, SSE channel full!", &device);
+		    }
 
                     println!(
                         "Sent epoch batch SSE for client {} and epoch {}",
