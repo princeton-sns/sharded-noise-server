@@ -17,12 +17,28 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 // Horribly unsafe AND unsound, never do this, this WILL break, it's terrible.
 static mut USERNAMES: Option<Vec<String>> = None;
 static mut COMMON_PAYLOADS: Option<HashMap<String, EncryptedOutboxMessage>> = None;
+static mut COMMON_PAYLOAD_LEN: usize = 0;
+static mut INDIVIDUAL_PAYLOAD_LEN: usize = 0;
 
 static GOOSE_USER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[tokio::main]
 async fn main() -> Result<(), GooseError> {
     let g = GooseAttack::initialize()?;
+
+    unsafe {
+	COMMON_PAYLOAD_LEN = std::env::vars()
+            .find(|(var, _)| var == "NOISE_CMPLDLEN")
+            .map(|(_, val)| val)
+	    .and_then(|val| val.parse::<usize>().ok())
+            .unwrap_or(12);
+
+	COMMON_PAYLOAD_LEN = std::env::vars()
+            .find(|(var, _)| var == "NOISE_IDPLDLEN")
+            .map(|(_, val)| val)
+	    .and_then(|val| val.parse::<usize>().ok())
+            .unwrap_or(42);
+    }
 
     let usernames_str = std::env::vars()
         .find(|(var, _)| var == "NOISE_USERS")
@@ -142,11 +158,11 @@ fn construct_message<'a>(
     _sender: &str,
     friends: impl Iterator<Item = Cow<'a, str>>,
 ) -> EncryptedOutboxMessage {
-    let common_payload = "Hello World!".to_string();
+    let common_payload = std::iter::repeat("X").take(unsafe { INDIVIDUAL_PAYLOAD_LEN }).collect::<String>();
 
     let recipient_payloads: HashMap<String, EncryptedPerRecipientPayload> = friends
         .map(|f| {
-            let ciphertext = format!("Super secret special message for {}", f);
+            let ciphertext = std::iter::repeat("X").take(unsafe { INDIVIDUAL_PAYLOAD_LEN }).collect::<String>();
             (
                 f.into_owned(),
                 EncryptedPerRecipientPayload {
