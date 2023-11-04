@@ -423,7 +423,7 @@ pub mod outbox {
     #[derive(Serialize, Deserialize)]
     pub enum PersistRecord<'a> {
         Epoch(u64),
-        Message(Cow<'a, Event>),
+        Message(Cow<'a, EventBatch>),
     }
 
     #[derive(Message, Clone)]
@@ -436,9 +436,9 @@ pub mod outbox {
 
     #[derive(Message, Serialize, Deserialize, Debug, Clone)]
     #[rtype(result = "Result<u64, EventError>")]
-    pub struct Event {
+    pub struct EventBatch {
         pub sender: String,
-        pub message: super::client_protocol::EncryptedOutboxMessage,
+        pub messages: LinkedList<super::client_protocol::EncryptedOutboxMessage>,
     }
 
     #[derive(Debug)]
@@ -452,7 +452,7 @@ pub mod outbox {
         pub Arc<super::ShardState>,
         pub u64,
         pub u8,
-        pub (usize, LinkedList<Event>),
+        pub (usize, LinkedList<EventBatch>),
     );
     #[derive(Message, Clone, Debug)]
     #[rtype(result = "()")]
@@ -510,31 +510,43 @@ pub mod outbox {
             let mut intershard = vec![vec![]; state.intershard_router_actors.len()];
             intershard.iter_mut().for_each(|v| v.reserve(queue_length));
 
-            for (idx, ev) in queue.into_iter().enumerate() {
-                // By means of this being a BTreeMap, the recipients
-                // will be sorted in key order
-                let receivers: Vec<_> = ev.message.enc_recipients.keys().cloned().collect();
+            let mut ev_seq: u64 = 0;
+            for ev_batch in queue.into_iter() {
+                bincode::serialize_into(
+                    &mut writer,
+                    &PersistRecord::Message(Cow::Borrowed(&ev_batch)),
+                )
+                .unwrap();
 
-                let seq = (epoch_id as u128) << 64
-                    | ((idx as u128) & 0x0000FFFFFFFFFFFF)
-                    | ((self.id as u128) << 48)
-                    | ((shard_id as u128) << 56);
+                for message in ev_batch.messages {
+                    // By means of this being a BTreeMap, the recipients
+                    // will be sorted in key order
+                    let receivers: Vec<_> = message.enc_recipients.keys().cloned().collect();
 
-                bincode::serialize_into(&mut writer, &PersistRecord::Message(Cow::Borrowed(&ev)))
-                    .unwrap();
+                    let seq = (epoch_id as u128) << 64
+                        | ((ev_seq as u128) & 0x0000FFFFFFFFFFFF)
+                        | ((self.id as u128) << 48)
+                        | ((shard_id as u128) << 56);
 
-                for (recipient, enc_recipient_payload) in ev.message.enc_recipients.into_iter() {
-                    let bucket = hash_into_bucket(&recipient, intershard.len(), true);
+                    for (recipient, enc_recipient_payload) in message.enc_recipients.into_iter() {
+                        let bucket = hash_into_bucket(&recipient, intershard.len(), true);
 
-                    let ibmsg = super::client_protocol::EncryptedInboxMessage {
-                        sender: ev.sender.clone(),
-                        recipients: receivers.clone(),
-                        enc_common: ev.message.enc_common.clone(),
-                        enc_recipient: enc_recipient_payload,
-                        seq_id: seq,
-                    };
+                        let ibmsg = super::client_protocol::EncryptedInboxMessage {
+                            sender: ev_batch.sender.clone(),
+                            recipients: receivers.clone(),
+                            enc_common: message.enc_common.clone(),
+                            enc_recipient: enc_recipient_payload,
+                            seq_id: seq,
+                        };
 
-                    intershard[bucket].push((recipient, ibmsg));
+                        intershard[bucket].push((recipient, ibmsg));
+                    }
+
+                    // Increment the sequence number for every message in a
+                    // batch. By traversing individual batches sequentially, we
+                    // guarantee that they will be assigned contiguous sequence
+                    // numbers:
+                    ev_seq += 1;
                 }
             }
 
@@ -544,7 +556,7 @@ pub mod outbox {
                 .into_iter()
                 .zip(state.intershard_router_actors.iter())
             {
-		messages.shrink_to_fit();
+                messages.shrink_to_fit();
 
                 let routed_batch = RoutedEpochBatch {
                     epoch_id,
@@ -559,7 +571,7 @@ pub mod outbox {
 
     pub struct OutboxActor {
         _id: u8,
-        queue: (usize, LinkedList<Event>),
+        queue: (usize, LinkedList<EventBatch>),
         epoch: Option<u64>,
         router: Addr<RouterActor>,
         state: Option<Arc<super::ShardState>>,
@@ -593,14 +605,17 @@ pub mod outbox {
         }
     }
 
-    impl Handler<Event> for OutboxActor {
+    impl Handler<EventBatch> for OutboxActor {
         type Result = Result<u64, EventError>;
 
-        fn handle(&mut self, ev: Event, _ctx: &mut Context<Self>) -> Self::Result {
+        // TODO: this must accept at most 2**48 events per epoch. Reaching that
+        // count would appear to be impossible, but we also don't have any
+        // checks in place for this.
+        fn handle(&mut self, evs: EventBatch, _ctx: &mut Context<Self>) -> Self::Result {
             if let Some(ref epoch_id) = self.epoch {
                 // Simply add the event to the queue:
-                self.queue.1.push_back(ev);
-                self.queue.0 += 1;
+                self.queue.0 += evs.messages.len();
+                self.queue.1.push_back(evs);
                 Ok(*epoch_id)
             } else {
                 Err(EventError::NoEpoch)
@@ -1064,9 +1079,12 @@ pub mod inbox {
                     .event("otkey"),
                 );
 
-		if let Err(TrySendError::Full(_)) = res {
-		    panic!("Could not send otkey request to client {}, SSE channel full!", client_id)
-		}
+                if let Err(TrySendError::Full(_)) = res {
+                    panic!(
+                        "Could not send otkey request to client {}, SSE channel full!",
+                        client_id
+                    )
+                }
             }
         }
     }
@@ -1155,10 +1173,10 @@ pub mod inbox {
     }
 
     impl Handler<ClearAllMessages> for InboxActor {
-	type Result = ();
-	fn handle(&mut self, _msg: ClearAllMessages, _ctx: &mut Context<Self>) -> Self::Result {
-	    self.client_mailboxes = HashMap::new();
-	}
+        type Result = ();
+        fn handle(&mut self, _msg: ClearAllMessages, _ctx: &mut Context<Self>) -> Self::Result {
+            self.client_mailboxes = HashMap::new();
+        }
     }
 
     // #[derive(Message, Clone, Debug)]
@@ -1257,9 +1275,12 @@ pub mod inbox {
                             .event("epoch_message_batch"),
                     );
 
-		    if let Err(TrySendError::Full(_)) = res {
-			panic!("Could not send message to client {}, SSE channel full!", &device);
-		    }
+                    if let Err(TrySendError::Full(_)) = res {
+                        panic!(
+                            "Could not send message to client {}, SSE channel full!",
+                            &device
+                        );
+                    }
 
                     println!(
                         "Sent epoch batch SSE for client {} and epoch {}",
@@ -1454,7 +1475,6 @@ struct BatchHashQuery {
     pub count: usize,
 }
 
-
 #[get("/shard/batch")]
 async fn inbox_shard_batch(
     state: web::Data<ShardState>,
@@ -1463,9 +1483,9 @@ async fn inbox_shard_batch(
     let mut map = HashMap::new();
 
     for i in 0..(query.count) {
-	let device_id = format!("{}", i);
-	let bucket = hash_into_bucket(&device_id, state.intershard_router_actors.len(), true);
-	map.insert(device_id, state.shard_map[bucket].clone());
+        let device_id = format!("{}", i);
+        let bucket = hash_into_bucket(&device_id, state.intershard_router_actors.len(), true);
+        map.insert(device_id, state.shard_map[bucket].clone());
     }
 
     web::Json(map)
@@ -1487,9 +1507,9 @@ async fn inbox_idx_batch(
     let mut map = HashMap::new();
 
     for i in 0..(query.count) {
-	let device_id = format!("{}", i);
-	let bucket = hash_into_bucket(&device_id, state.intershard_router_actors.len(), false);
-	map.insert(device_id, state.shard_map[bucket].clone());
+        let device_id = format!("{}", i);
+        let bucket = hash_into_bucket(&device_id, state.intershard_router_actors.len(), false);
+        map.insert(device_id, state.shard_map[bucket].clone());
     }
 
     web::Json(map)
@@ -1497,7 +1517,7 @@ async fn inbox_idx_batch(
 
 #[post("/message")]
 async fn handle_message(
-    msg: web::Json<client_protocol::EncryptedOutboxMessage>,
+    msgs: web::Json<std::collections::LinkedList<client_protocol::EncryptedOutboxMessage>>,
     state: web::Data<ShardState>,
     auth: web::Header<BearerToken>,
     req: HttpRequest,
@@ -1505,8 +1525,7 @@ async fn handle_message(
     // println!("Handling message for {:?}: {:?}", auth.token(), msg);
 
     // Check whether we are the right shard for this client_id:
-    let shard_bucket =
-        hash_into_bucket(auth.token(), state.intershard_router_actors.len(), true);
+    let shard_bucket = hash_into_bucket(auth.token(), state.intershard_router_actors.len(), true);
     if (state.shard_id as usize) != shard_bucket {
         HttpResponse::TemporaryRedirect()
             .append_header((
@@ -1520,21 +1539,21 @@ async fn handle_message(
             ))
             .finish()
     } else {
-	let sender_id = auth.into_inner().into_token();
-	let outbox_actors_cnt = state.outbox_actors.len();
-	let actor_idx = hash_into_bucket(&sender_id, outbox_actors_cnt, false);
+        let sender_id = auth.into_inner().into_token();
+        let outbox_actors_cnt = state.outbox_actors.len();
+        let actor_idx = hash_into_bucket(&sender_id, outbox_actors_cnt, false);
 
-	// Now, send the message to the corresponding actor:
-	let epoch = state.outbox_actors[actor_idx]
-            .send(outbox::Event {
-		sender: sender_id,
-		message: msg.into_inner(),
+        // Now, send the message to the corresponding actor:
+        let epoch = state.outbox_actors[actor_idx]
+            .send(outbox::EventBatch {
+                sender: sender_id,
+                messages: msgs.into_inner(),
             })
             .await
             .unwrap()
             .unwrap();
 
-	HttpResponse::Ok().json(epoch)
+        HttpResponse::Ok().json(epoch)
     }
 }
 
@@ -1576,11 +1595,9 @@ async fn delete_messages(
 }
 
 #[delete("/inbox/clear-all")]
-async fn clear_all_messages(
-    state: web::Data<ShardState>,
-) -> impl Responder {
+async fn clear_all_messages(state: web::Data<ShardState>) -> impl Responder {
     for (_, ref iba) in state.inbox_actors.iter() {
-	iba.send(inbox::ClearAllMessages).await.unwrap()
+        iba.send(inbox::ClearAllMessages).await.unwrap()
     }
 
     "".to_string()
@@ -1957,12 +1974,12 @@ pub async fn init(
             .service(handle_message)
             .service(retrieve_messages)
             // .service(delete_messages)
-	    .service(delete_messages)
+            .service(delete_messages)
             .service(clear_all_messages)
             .service(stream_messages)
             .service(inbox_shard)
             .service(inbox_idx)
-	    .service(inbox_shard_batch)
+            .service(inbox_shard_batch)
             .service(inbox_idx_batch)
             .service(get_otkey)
             .service(add_otkeys)
