@@ -10,7 +10,7 @@ use rand::seq::SliceRandom;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Serialize;
 
-use std::borrow::{Borrow, Cow};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -185,7 +185,9 @@ async fn post_message(user: &mut GooseUser) -> TransactionResult {
     );
 
     let request_builder = user
-        .get_request_builder(&GooseMethod::Post, "/message")?
+	// JSON:
+        // .get_request_builder(&GooseMethod::Post, "/message")?
+        .get_request_builder(&GooseMethod::Post, "/message-bin")?
         .headers(headers);
 
     let msg: Cow<'static, EncryptedOutboxMessage> = unsafe {
@@ -200,16 +202,20 @@ async fn post_message(user: &mut GooseUser) -> TransactionResult {
             })
     };
 
+    // JSON:
     // let goose_request = GooseRequest::builder()
     //     .method(GooseMethod::Post)
     //     .path("/message")
     //     .set_request_builder(request_builder.json(Borrow::<EncryptedOutboxMessage>::borrow(&msg)))
     //     .build();
-
+    let mut ll = std::collections::LinkedList::new();
+    ll.push_back(msg.into_owned());
+    let serialized = bincode::serialize(&ll).unwrap();
+    //panic!("Serialized: {:?}", serialized);
     let goose_request = GooseRequest::builder()
         .method(GooseMethod::Post)
         .path("/message-bin")
-        .set_request_builder(request_builder.body(bincode::serialize(&[Borrow::<EncryptedOutboxMessage>::borrow(&msg)]).unwrap()))
+        .set_request_builder(request_builder.body(serialized))
         .build();
 
     let _goose_metrics = user.request(goose_request).await;
