@@ -11,8 +11,10 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Serialize;
 
 use std::borrow::{Borrow, Cow};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use noise_server_lib::shard::client_protocol::{EncryptedPerRecipientPayload, EncryptedCommonPayload, EncryptedOutboxMessage};
 
 // Horribly unsafe AND unsound, never do this, this WILL break, it's terrible.
 static mut USERNAMES: Option<Vec<String>> = None;
@@ -123,18 +125,6 @@ async fn main() -> Result<(), GooseError> {
 #[derive(Serialize)]
 struct Username(String);
 
-#[derive(Debug, Serialize, Clone)]
-pub struct EncryptedPerRecipientPayload {
-    pub c_type: usize,
-    pub ciphertext: String,
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub struct EncryptedOutboxMessage {
-    pub enc_common: String,
-    pub enc_recipients: HashMap<String, EncryptedPerRecipientPayload>,
-}
-
 async fn set_username(user: &mut GooseUser) -> TransactionResult {
     let deterministic_users = std::env::vars()
         .find(|(var, _)| var == "DET_USERS")
@@ -162,11 +152,11 @@ fn construct_message<'a>(
     _sender: &str,
     friends: impl Iterator<Item = Cow<'a, str>>,
 ) -> EncryptedOutboxMessage {
-    let common_payload = std::iter::repeat("X").take(COMMON_PAYLOAD_LEN.load(Ordering::Relaxed)).collect::<String>();
+    let common_payload = std::iter::repeat(b'X' as u8).take(COMMON_PAYLOAD_LEN.load(Ordering::Relaxed)).collect::<Vec<u8>>();
 
-    let recipient_payloads: HashMap<String, EncryptedPerRecipientPayload> = friends
+    let recipient_payloads: BTreeMap<String, EncryptedPerRecipientPayload> = friends
         .map(|f| {
-            let ciphertext = std::iter::repeat("X").take(INDIVIDUAL_PAYLOAD_LEN.load(Ordering::Relaxed)).collect::<String>();
+            let ciphertext = std::iter::repeat(b'X' as u8).take(INDIVIDUAL_PAYLOAD_LEN.load(Ordering::Relaxed)).collect::<Vec<u8>>();
             (
                 f.into_owned(),
                 EncryptedPerRecipientPayload {
@@ -178,7 +168,7 @@ fn construct_message<'a>(
         .collect();
 
     EncryptedOutboxMessage {
-        enc_common: common_payload,
+        enc_common: EncryptedCommonPayload(common_payload),
         enc_recipients: recipient_payloads,
     }
 }
@@ -210,10 +200,16 @@ async fn post_message(user: &mut GooseUser) -> TransactionResult {
             })
     };
 
+    // let goose_request = GooseRequest::builder()
+    //     .method(GooseMethod::Post)
+    //     .path("/message")
+    //     .set_request_builder(request_builder.json(Borrow::<EncryptedOutboxMessage>::borrow(&msg)))
+    //     .build();
+
     let goose_request = GooseRequest::builder()
         .method(GooseMethod::Post)
-        .path("/message")
-        .set_request_builder(request_builder.json(Borrow::<EncryptedOutboxMessage>::borrow(&msg)))
+        .path("/message-bin")
+        .set_request_builder(request_builder.body(bincode::serialize(&[Borrow::<EncryptedOutboxMessage>::borrow(&msg)]).unwrap()))
         .build();
 
     let _goose_metrics = user.request(goose_request).await;

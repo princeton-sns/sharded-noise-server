@@ -1,8 +1,8 @@
 use actix_web::{App, HttpServer};
 use clap::{Parser, Subcommand};
 
-pub mod sequencer;
-pub mod shard;
+use noise_server_lib::sequencer;
+use noise_server_lib::shard;
 
 #[derive(Subcommand, Debug)]
 enum Commands {

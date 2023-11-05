@@ -5,6 +5,14 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lib]
+name = "noise_server_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "noise_server"
+path = "src/bin/server.rs"
+
 [dependencies]
 actix = "0.13.0"
 actix-web = "4.3.1"

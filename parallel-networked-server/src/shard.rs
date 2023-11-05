@@ -19,12 +19,12 @@ pub mod client_protocol {
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
     #[serde(transparent)]
-    pub struct EncryptedCommonPayload(pub String);
+    pub struct EncryptedCommonPayload(pub Vec<u8>);
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
     pub struct EncryptedPerRecipientPayload {
         pub c_type: usize,
-        pub ciphertext: String,
+        pub ciphertext: Vec<u8>,
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -87,7 +87,7 @@ pub mod client_protocol {
                 hasher.finalize_into_reset((&mut recipients_digest).into());
 
                 let mut payload_digest = [0; 32];
-                hasher.update(message.borrow().enc_common.0.as_bytes());
+                hasher.update(&message.borrow().enc_common.0);
                 hasher.finalize_into_reset((&mut payload_digest).into());
 
                 (message.borrow().seq_id, recipients_digest, payload_digest)
@@ -1515,15 +1515,12 @@ async fn inbox_idx_batch(
     web::Json(map)
 }
 
-#[post("/message")]
 async fn handle_message(
-    msgs: web::Json<std::collections::LinkedList<client_protocol::EncryptedOutboxMessage>>,
+    msgs: std::collections::LinkedList<client_protocol::EncryptedOutboxMessage>,
     state: web::Data<ShardState>,
     auth: web::Header<BearerToken>,
     req: HttpRequest,
 ) -> impl Responder {
-    // println!("Handling message for {:?}: {:?}", auth.token(), msg);
-
     // Check whether we are the right shard for this client_id:
     let shard_bucket = hash_into_bucket(auth.token(), state.intershard_router_actors.len(), true);
     if (state.shard_id as usize) != shard_bucket {
@@ -1547,7 +1544,7 @@ async fn handle_message(
         let epoch = state.outbox_actors[actor_idx]
             .send(outbox::EventBatch {
                 sender: sender_id,
-                messages: msgs.into_inner(),
+                messages: msgs,
             })
             .await
             .unwrap()
@@ -1555,6 +1552,26 @@ async fn handle_message(
 
         HttpResponse::Ok().json(epoch)
     }
+}
+
+#[post("/message")]
+async fn handle_message_json(
+    msgs: web::Json<std::collections::LinkedList<client_protocol::EncryptedOutboxMessage>>,
+    state: web::Data<ShardState>,
+    auth: web::Header<BearerToken>,
+    req: HttpRequest,
+) -> impl Responder {
+    handle_message(msgs.into_inner(), state, auth, req).await
+}
+
+#[post("/message-bin")]
+async fn handle_message_bin(
+    body: web::Bytes,
+    state: web::Data<ShardState>,
+    auth: web::Header<BearerToken>,
+    req: HttpRequest,
+) -> impl Responder {
+    handle_message(bincode::deserialize(&body).unwrap(), state, auth, req).await
 }
 
 #[get("/events")]
@@ -1971,7 +1988,8 @@ pub async fn init(
             .app_data(web::PayloadConfig::new(usize::MAX))
             .app_data(web::JsonConfig::default().limit(usize::MAX))
             // Client API
-            .service(handle_message)
+            .service(handle_message_json)
+            .service(handle_message_bin)
             .service(retrieve_messages)
             // .service(delete_messages)
             .service(delete_messages)
